@@ -1,10 +1,6 @@
-use std::ops::{Add, AddAssign, Sub};
 
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-pub struct Address(pub usize);
 
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-pub struct Size(pub usize);
+use super::{Size, Address};
 
 const MIN_ALLOC_SIZE: Size = Size(8);
 
@@ -31,33 +27,6 @@ impl Allocation {
     }
 }
 
-impl Add<Size> for Address {
-    type Output = Address;
-    fn add(self, rhs: Size) -> Self::Output {
-        Address(self.0 + rhs.0)
-    }
-}
-
-
-impl Add<Size> for Size {
-    type Output = Size;
-    fn add(self, rhs: Size) -> Self::Output {
-        Size(self.0 + rhs.0)
-    }
-}
-
-impl Sub<Size> for Size {
-    type Output = Size;
-    fn sub(self, rhs: Size) -> Self::Output {
-        Size(self.0 - rhs.0)
-    }
-}
-
-impl AddAssign<Size> for Size {
-    fn add_assign(&mut self, rhs: Size) {
-        self.0 += rhs.0;
-    }
-}
 
 pub struct Allocator {
     allocations: Vec<Allocation>,
@@ -143,7 +112,7 @@ impl Allocator {
 
                     if freed_alloc.end() == next_free_alloc.start() {
                         self.remove_free_by_size(next_free_alloc);
-                        let replacement = Allocation::new(freed_alloc.start(), 
+                        let replacement = Allocation::new(freed_alloc.start(),
                                                           next_free_alloc.size + freed_alloc.size);
                         self.free_by_addr[index] = replacement;
                         self.assert_order_free_by_addr(index);
@@ -151,13 +120,13 @@ impl Allocator {
                         return
                     }
                 }
-                
+
                 if index > 0 {
                     let prev_free_alloc = self.free_by_addr[index - 1];
 
                     if prev_free_alloc.end() == freed_alloc.start() {
                         self.remove_free_by_size(prev_free_alloc);
-                        let replacement = Allocation::new(prev_free_alloc.start(), 
+                        let replacement = Allocation::new(prev_free_alloc.start(),
                                                           prev_free_alloc.size + freed_alloc.size);
                         self.free_by_addr[index - 1] = replacement;
                         self.assert_order_free_by_addr(index - 1);
@@ -165,7 +134,7 @@ impl Allocator {
                         return
                     }
                 }
-                    
+
                 self.free_by_addr.insert(index, freed_alloc);
                 self.assert_order_free_by_addr(index);
                 self.insert_free_by_size(freed_alloc);
@@ -190,9 +159,9 @@ impl Allocator {
                 self.free_by_size.insert(index, alloc);
             }
             Err(index) => {
-                self.free_by_size.insert(index, alloc);   
+                self.free_by_size.insert(index, alloc);
             }
-        };    
+        };
     }
 
     fn remove_free_by_size(&mut self, alloc: Allocation) {
@@ -204,10 +173,10 @@ impl Allocator {
 
                 assert_eq!(self.free_by_size.remove(index), alloc);
             }
-            Err(index) => {
-                panic!("Allocation not found. No allocation with the given size.")   
+            Err(_) => {
+                panic!("Allocation not found. No allocation with the given size.")
             }
-        };    
+        };
     }
 
     fn remove_free_by_addr(&mut self, alloc: Allocation) {
@@ -215,8 +184,8 @@ impl Allocator {
             Ok(index) => {
                 assert_eq!(self.free_by_addr.remove(index), alloc);
             }
-            Err(index) => {
-                panic!("Allocation not found. No allocation with the given addr.")   
+            Err(_) => {
+                panic!("Allocation not found. No allocation with the given addr.")
             }
         };
     }
@@ -258,8 +227,8 @@ mod tests {
 
     #[test]
     fn new() {
-        let mut allocator = Allocator::new(Size(91));
-        
+        let allocator = Allocator::new(Size(91));
+
         assert_eq!(allocator.allocations, vec![]);
         assert_eq!(allocator.free_by_addr, vec![Allocation::new(Address(0), Size(91))]);
         assert_eq!(allocator.free_by_size, vec![Allocation::new(Address(0), Size(91))]);
@@ -280,7 +249,7 @@ mod tests {
         let mut allocator = Allocator::new(Size(100));
         let alloc = allocator.alloc(Size(10));
         allocator.free(alloc.addr);
-        
+
         assert_eq!(allocator.allocations, vec![]);
         assert_eq!(allocator.free_by_addr, vec![Allocation::new(Address(0), Size(100))]);
         assert_eq!(allocator.free_by_size, vec![Allocation::new(Address(0), Size(100))]);
@@ -293,8 +262,8 @@ mod tests {
         let alloc = allocator.alloc(Size(10));
         allocator.alloc(Size(10));
         allocator.free(alloc.addr);
-        
-        assert_eq!(allocator.allocations, vec![Allocation::new(Address(0), Size(10)), 
+
+        assert_eq!(allocator.allocations, vec![Allocation::new(Address(0), Size(10)),
                                                Allocation::new(Address(20), Size(10))]);
         assert_eq!(allocator.free_by_addr, vec![Allocation::new(Address(10), Size(10)),
                                                 Allocation::new(Address(30), Size(70))]);
@@ -311,8 +280,8 @@ mod tests {
         allocator.alloc(Size(10));
         allocator.free(alloc1.addr);
         allocator.free(alloc2.addr);
-        
-        assert_eq!(allocator.allocations, vec![Allocation::new(Address(0), Size(10)), 
+
+        assert_eq!(allocator.allocations, vec![Allocation::new(Address(0), Size(10)),
                                                Allocation::new(Address(30), Size(10))]);
         assert_eq!(allocator.free_by_addr, vec![Allocation::new(Address(10), Size(20)),
                                                 Allocation::new(Address(40), Size(60))]);
