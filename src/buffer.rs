@@ -39,7 +39,7 @@ impl<'data> Buffer<'data> {
 
     #[inline(always)]
     pub fn len(&self) -> Size {
-        Size(self.data.len() - self.start)
+        Size((self.data.len() - self.start) as u32)
     }
 
     pub fn start_sub_buffer<'s>(&'s mut self) -> Buffer<'s>

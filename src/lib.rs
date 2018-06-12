@@ -1,19 +1,50 @@
 
 extern crate byteorder;
+extern crate metrohash;
+
+#[cfg(test)]
+extern crate rand;
 
 use std::collections::HashSet;
 
 mod buffer;
 mod address;
 mod allocator;
+mod hashtable;
 
 pub use address::{Address, Size};
 pub use buffer::{Buffer, BufferProvider};
-use allocator::Allocator;
+pub use allocator::Allocator;
+pub use hashtable::HashTable;
 
 pub trait Storage {
     fn write_bytes(&mut self, addr: Address, b: &[u8]);
     fn get_bytes(&self, addr: Address, len: Size) -> &[u8];
+}
+
+pub struct MemStore {
+    data: Vec<u8>,
+}
+
+impl MemStore {
+    pub fn new(size: usize) -> MemStore {
+        MemStore {
+            data: vec![0u8; size],
+        }
+    }
+}
+
+impl Storage for MemStore {
+    fn write_bytes(&mut self, addr: Address, b: &[u8]) {
+        let start = addr.0 as usize;
+        let end = start + b.len();
+
+        self.data[start .. end].copy_from_slice(b);
+    }
+
+    fn get_bytes(&self, addr: Address, len: Size) -> &[u8] {
+        &self.data[addr.0 as usize .. (addr + len).0 as usize]
+    }
 }
 
 pub struct Encoder<'buf, 'db, S: Storage + 'db> {

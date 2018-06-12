@@ -166,12 +166,43 @@ impl Allocator {
 
     fn remove_free_by_size(&mut self, alloc: Allocation) {
         match self.free_by_size.binary_search_by_key(&alloc.size, |alloc| alloc.size) {
-            Ok(mut index) => {
-                while self.free_by_size[index].addr != alloc.addr {
+            Ok(start_index) => {
+                // We might have landed in the middle of block of allocations with
+                // the same size, so we have to search forward and backward.
+
+                // Search forward from start_index:
+                let mut index = start_index;
+                loop {
+                    if self.free_by_size[index].addr == alloc.addr {
+                        assert_eq!(self.free_by_size.remove(index), alloc);
+                        return
+                    }
+
                     index += 1;
+
+                    if index == self.free_by_size.len() || self.free_by_size[index].size != alloc.size {
+                        break;
+                    }
                 }
 
-                assert_eq!(self.free_by_size.remove(index), alloc);
+                // search backwards from start_index
+                if start_index > 0 && self.free_by_size[start_index - 1].size == alloc.size {
+                    index = start_index - 1;
+                    loop {
+                        if self.free_by_size[index].addr == alloc.addr {
+                            assert_eq!(self.free_by_size.remove(index), alloc);
+                            return
+                        }
+
+                        if index == 0 || self.free_by_size[index - 1].size != alloc.size {
+                            break;
+                        }
+
+                        index -= 1;
+                    }
+                }
+
+                unreachable!("We should have found the allocation with the correct address.")
             }
             Err(_) => {
                 panic!("Allocation not found. No allocation with the given size.")

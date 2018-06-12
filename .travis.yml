@@ -1,0 +1,4 @@
+language: rust
+script:
+  - cargo test
+  - RUSTFLAGS=-Cdebug-assertions=on cargo run --example hashtable_stress_test --release
