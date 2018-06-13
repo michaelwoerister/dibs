@@ -35,6 +35,10 @@ fn main() {
 
         table.sanity_check_table();
 
+        for (key, value) in reference.iter() {
+            assert_eq!(table.find(&key[..], &storage), Some(&value[..]));
+        }
+
         let mut data = HashMap::with_capacity(reference.len());
         table.iter(&storage, |key, value| {
             data.insert(key.to_owned(), value.to_owned());
