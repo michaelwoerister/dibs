@@ -14,12 +14,69 @@ mod hashtable;
 
 pub use address::{Address, Size};
 pub use buffer::{Buffer, BufferProvider};
-pub use allocator::Allocator;
+pub use allocator::{Allocator, Allocation};
 pub use hashtable::HashTable;
 
 pub trait Storage {
+    fn size(&self) -> Size;
     fn write_bytes(&mut self, addr: Address, b: &[u8]);
     fn get_bytes(&self, addr: Address, len: Size) -> &[u8];
+    fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8];
+
+}
+
+pub struct Memory<S: Storage> {
+    storage: S,
+    allocator: Allocator,
+}
+
+impl<S: Storage> Memory<S> {
+
+    #[inline]
+    pub fn new(storage: S) -> Memory<S> {
+        Memory {
+            allocator: Allocator::new(storage.size()),
+            storage,
+        }
+    }
+
+    #[inline]
+    pub fn new_with_allocator(storage: S, allocator: Allocator) -> Memory<S> {
+        assert!(storage.size() >= allocator.total_size());
+
+        Memory {
+            allocator,
+            storage,
+        }
+    }
+
+    #[inline]
+    pub fn write_bytes(&mut self, addr: Address, b: &[u8]) {
+        self.storage.write_bytes(addr, b);
+    }
+
+    #[inline]
+    pub fn get_bytes(&self, addr: Address, len: Size) -> &[u8] {
+        self.storage.get_bytes(addr, len)
+    }
+
+    #[inline]
+    pub fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8] {
+        self.storage.get_bytes_mut(addr, len)
+    }
+
+    #[inline]
+    pub fn alloc(&mut self, size: Size) -> Allocation {
+        self.allocator.alloc(size)
+    }
+
+    #[inline]
+    pub fn free(&mut self, allocation: Allocation) {
+        for b in self.storage.get_bytes_mut(allocation.addr, allocation.size) {
+            *b = 0;
+        }
+        self.allocator.free(allocation);
+    }
 }
 
 pub struct MemStore {
@@ -35,6 +92,12 @@ impl MemStore {
 }
 
 impl Storage for MemStore {
+    #[inline]
+    fn size(&self) -> Size {
+        Size::from_usize(self.data.len())
+    }
+
+    #[inline]
     fn write_bytes(&mut self, addr: Address, b: &[u8]) {
         let start = addr.0 as usize;
         let end = start + b.len();
@@ -42,8 +105,14 @@ impl Storage for MemStore {
         self.data[start .. end].copy_from_slice(b);
     }
 
+    #[inline]
     fn get_bytes(&self, addr: Address, len: Size) -> &[u8] {
         &self.data[addr.0 as usize .. (addr + len).0 as usize]
+    }
+
+    #[inline]
+    fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8] {
+        &mut self.data[addr.0 as usize .. (addr + len).0 as usize]
     }
 }
 
@@ -212,7 +281,7 @@ impl<S: Storage> Database<S> {
 
     pub fn delete_record(&mut self, record_id: RecordId) {
         let record = self.records[record_id.idx()];
-        self.alloc.free(record.addr);
+        self.alloc.free(Allocation::new(record.addr, record.size));
         self.records[record_id.idx()] = Record::null();
         self.record_id_free_list.push(record_id);
     }

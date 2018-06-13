@@ -2,7 +2,7 @@
 
 use super::{Size, Address};
 
-const MIN_ALLOC_SIZE: Size = Size(8);
+// const MIN_ALLOC_SIZE: Size = Size(8);
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct Allocation {
@@ -11,7 +11,8 @@ pub struct Allocation {
 }
 
 impl Allocation {
-    fn new(addr: Address, size: Size) -> Allocation {
+    #[inline]
+    pub fn new(addr: Address, size: Size) -> Allocation {
         Allocation {
             addr,
             size,
@@ -32,6 +33,7 @@ pub struct Allocator {
     allocations: Vec<Allocation>,
     free_by_addr: Vec<Allocation>,
     free_by_size: Vec<Allocation>,
+    total_size: Size,
 }
 
 
@@ -42,7 +44,12 @@ impl Allocator {
             allocations: vec![],
             free_by_addr: vec![Allocation::new(Address(0), total_size)],
             free_by_size: vec![Allocation::new(Address(0), total_size)],
+            total_size,
         }
+    }
+
+    pub fn total_size(&self) -> Size {
+        self.total_size
     }
 
     pub fn alloc(&mut self, size: Size) -> Allocation {
@@ -57,16 +64,21 @@ impl Allocator {
             }
             Err(index) => {
                 // Next best fit.
+                if index == self.free_by_size.len() {
+                    println!("{:?}, size={:?}", self.free_by_size, size);
+                }
+
                 let available_alloc = self.free_by_size[index];
                 assert!(available_alloc.size >= size);
                 let remaining_space = available_alloc.size - size;
 
-                if remaining_space < MIN_ALLOC_SIZE {
-                    self.free_by_size.remove(index);
-                    self.remove_free_by_addr(available_alloc);
-                    self.insert_alloc(available_alloc);
-                    available_alloc
-                } else {
+                // if remaining_space < MIN_ALLOC_SIZE {
+                //     self.free_by_size.remove(index);
+                //     self.remove_free_by_addr(available_alloc);
+                //     self.insert_alloc(available_alloc);
+                //     available_alloc
+                // } else
+                {
                     self.free_by_size.remove(index);
                     let remaining_free_alloc = Allocation::new(available_alloc.start() + size, remaining_space);
                     self.insert_free_by_size(remaining_free_alloc);
@@ -89,11 +101,13 @@ impl Allocator {
         }
     }
 
-    pub fn free(&mut self, addr: Address) {
-        let freed_alloc = if let Ok(alloc_index) = self.find_alloc_by_address(addr) {
-            self.allocations.remove(alloc_index)
+    pub fn free(&mut self, freed_alloc: Allocation) {
+        let addr = freed_alloc.addr;
+        if let Ok(alloc_index) = self.find_alloc_by_address(addr) {
+            let alloc = self.allocations.remove(alloc_index);
+            assert_eq!(alloc, freed_alloc, "Allocations differ in size.");
         } else {
-             panic!("Could not find allocation at {:?}", addr);
+            panic!("Could not find allocation at {:?}", addr);
         };
 
         match self.find_free_by_address(addr) {
@@ -279,7 +293,7 @@ mod tests {
     fn free_at_end() {
         let mut allocator = Allocator::new(Size(100));
         let alloc = allocator.alloc(Size(10));
-        allocator.free(alloc.addr);
+        allocator.free(alloc);
 
         assert_eq!(allocator.allocations, vec![]);
         assert_eq!(allocator.free_by_addr, vec![Allocation::new(Address(0), Size(100))]);
@@ -292,7 +306,7 @@ mod tests {
         allocator.alloc(Size(10));
         let alloc = allocator.alloc(Size(10));
         allocator.alloc(Size(10));
-        allocator.free(alloc.addr);
+        allocator.free(alloc);
 
         assert_eq!(allocator.allocations, vec![Allocation::new(Address(0), Size(10)),
                                                Allocation::new(Address(20), Size(10))]);
@@ -309,8 +323,8 @@ mod tests {
         let alloc1 = allocator.alloc(Size(10));
         let alloc2 = allocator.alloc(Size(10));
         allocator.alloc(Size(10));
-        allocator.free(alloc1.addr);
-        allocator.free(alloc2.addr);
+        allocator.free(alloc1);
+        allocator.free(alloc2);
 
         assert_eq!(allocator.allocations, vec![Allocation::new(Address(0), Size(10)),
                                                Allocation::new(Address(30), Size(10))]);

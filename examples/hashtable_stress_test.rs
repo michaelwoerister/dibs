@@ -7,10 +7,10 @@ use rand::{thread_rng, random, Rng};
 use std::collections::HashMap;
 
 fn main() {
-    let (mut allocator, mut storage) = create_allocator_and_storage();
+    let mut memory = create_memory();
 
     let mut reference = HashMap::new();
-    let mut table = HashTable::new();
+    let mut table = HashTable::new(&mut memory);
 
     let mut next_table_size_to_report = 100;
 
@@ -24,11 +24,11 @@ fn main() {
                 let value: [u8; 3] = [random(), random(), random()];
 
                 reference.insert(key[..].to_owned(), value[..].to_owned());
-                table.insert(&key, &value, &mut storage, &mut allocator);
+                table.insert(&key, &value);
             }
             181 ... 255 => {
                 reference.remove(&key[..]);
-                table.remove(&key, &mut storage, &mut allocator);
+                table.remove(&key);
             }
             _ => unreachable!()
         }
@@ -36,11 +36,11 @@ fn main() {
         table.sanity_check_table();
 
         for (key, value) in reference.iter() {
-            assert_eq!(table.find(&key[..], &storage), Some(&value[..]));
+            assert_eq!(table.find(&key[..]), Some(&value[..]));
         }
 
         let mut data = HashMap::with_capacity(reference.len());
-        table.iter(&storage, |key, value| {
+        table.iter(|key, value| {
             data.insert(key.to_owned(), value.to_owned());
         });
 
@@ -67,11 +67,9 @@ fn main() {
     }
 }
 
-fn create_allocator_and_storage() -> (Allocator, MemStore) {
-    let mut allocator = Allocator::new(Size(10000000));
-    let storage = MemStore::new(10000000);
+fn create_memory() -> Memory<MemStore> {
+    let mut memory = Memory::new(MemStore::new(100000000));
     // Make sure we reserve the Null address.
-    allocator.alloc(Size(10));
-
-    (allocator, storage)
+    memory.alloc(Size(10));
+    memory
 }

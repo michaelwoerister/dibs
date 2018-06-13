@@ -1,66 +1,73 @@
 
 use std::mem;
 use byteorder::{LittleEndian, ByteOrder};
-use allocator::Allocator;
-use {Storage, Address, Size};
+use allocator::Allocation;
+use {Storage, Address, Size, Memory};
 
-const LEN_OFFSET: usize = 0;
-const CAPACITY_OFFSET: usize = mem::size_of::<Size>();
+const LEN_OFFSET: Size = Size(0);
+const CAPACITY_OFFSET: Size = Size(mem::size_of::<Size>() as u32);
 
-const HEADER_SIZE: usize = 2 * mem::size_of::<Size>();
-const ENTRY_SIZE: usize = mem::size_of::<Entry>();
+const HEADER_SIZE: Size = Size(2 * mem::size_of::<Size>() as u32);
+const ENTRY_SIZE: Size = Size(mem::size_of::<Entry>() as u32);
 
 const EMPTY_ENTRY: Address = Address(0);
 
-pub struct HashTable {
-    bytes: Vec<u8>,
+pub struct HashTable<'m, S: Storage + 'm> {
+    data: Allocation,
+    memory: &'m mut Memory<S>,
 }
 
-impl HashTable {
+impl<'m, S: Storage + 'm> HashTable<'m, S> {
     #[inline]
-    pub fn new() -> HashTable {
-        HashTable::with_capacity(0)
+    pub fn new(memory: &'m mut Memory<S>) -> HashTable<'m, S> {
+        HashTable::with_capacity(memory, Size(0))
     }
 
-    pub fn with_capacity(capacity: usize) -> HashTable {
-        let byte_count = byte_count_for_capacity(capacity);
-        let mut bytes = vec![0; byte_count];
-
-        LittleEndian::write_u32(&mut bytes[LEN_OFFSET ..], Size(0).0);
-        LittleEndian::write_u32(&mut bytes[CAPACITY_OFFSET ..], Size::from_usize(capacity).0);
+    pub fn with_capacity(memory: &'m mut Memory<S>, capacity: Size) -> HashTable<'m, S> {
+        let data = Self::alloc_with_capacity(memory, capacity);
 
         HashTable {
-            bytes
+            data,
+            memory,
         }
     }
 
+    fn alloc_with_capacity(memory: &'m mut Memory<S>, capacity: Size) -> Allocation {
+        let byte_count = byte_count_for_capacity(capacity);
+        let data = memory.alloc(byte_count);
+
+        Self::set_len_raw(memory, data, Size(0));
+        Self::set_capacity_raw(memory, data, capacity);
+
+        data
+    }
+
     #[inline]
-    fn set_len(&mut self, len: Size) {
-         LittleEndian::write_u32(&mut self.bytes[LEN_OFFSET ..], len.0);
+    fn set_len_raw(memory: &'m mut Memory<S>, data: Allocation, len: Size) {
+        let addr = data.addr + LEN_OFFSET;
+        LittleEndian::write_u32(memory.get_bytes_mut(addr, Size(4)), len.0);
+    }
+
+    #[inline]
+    fn set_capacity_raw(memory: &'m mut Memory<S>, data: Allocation, capacity: Size) {
+        let addr = data.addr + CAPACITY_OFFSET;
+        LittleEndian::write_u32(memory.get_bytes_mut(addr, Size(4)), capacity.0);
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        LittleEndian::read_u32(&self.bytes[LEN_OFFSET..]) as usize
+        let addr = self.data.addr + LEN_OFFSET;
+        LittleEndian::read_u32(self.memory.get_bytes(addr, Size(4))) as usize
     }
 
     #[inline]
     pub fn capacity(&self) -> usize {
-        LittleEndian::read_u32(&self.bytes[CAPACITY_OFFSET..]) as usize
+        let addr = self.data.addr + CAPACITY_OFFSET;
+        LittleEndian::read_u32(self.memory.get_bytes(addr, Size(4))) as usize
     }
 
-    #[inline]
-    pub fn read_view(&self) -> ReadView {
-        ReadView {
-            bytes: &self.bytes[..]
-        }
-    }
-
-    pub fn find<'storage, S: Storage>(&self,
-                                      key: &[u8],
-                                      storage: &'storage S)
-                                      -> Option<&'storage [u8]> {
-        let table_size = self.table_size();
+    pub fn find(&self, key: &[u8]) -> Option<&[u8]> {
+        let table_size = Self::table_size(self.data);
         let hash = hash_for(key);
         let mut index = hash % table_size;
 
@@ -69,29 +76,25 @@ impl HashTable {
 
             if entry.key == EMPTY_ENTRY {
                 return None
-            } else if load_data(storage, entry.key) == key {
-                return Some(load_data(storage, entry.value))
+            } else if self.load_data(entry.key) == key {
+                return Some(self.load_data(entry.value))
             }
 
             index = advance_index(index, table_size);
         }
     }
 
-    pub fn insert<S: Storage>(&mut self,
-                              key: &[u8],
-                              value: &[u8],
-                              storage: &mut S,
-                              allocator: &mut Allocator) -> bool {
+    pub fn insert(&mut self, key: &[u8], value: &[u8]) -> bool {
         if self.len() >= self.capacity() {
             let new_capacity = if self.capacity() == 0 {
                 8
             } else {
-                (self.capacity() as u32 * 3) / 2
+                (self.capacity() * 3) / 2
             };
-            self.resize(new_capacity);
+            self.resize(Size::from_usize(new_capacity));
         }
 
-        let table_size = self.table_size();
+        let table_size = Self::table_size(self.data);
         let hash = hash_for(key);
         let mut index = hash % table_size;
 
@@ -100,8 +103,8 @@ impl HashTable {
 
             if entry.key == EMPTY_ENTRY {
                 let new_entry = Entry {
-                    key: store_data(storage, allocator, key),
-                    value: store_data(storage, allocator, value),
+                    key: self.store_data(key),
+                    value: self.store_data(value),
                     hash,
                 };
                 self.set_entry(index, new_entry);
@@ -109,7 +112,7 @@ impl HashTable {
                 debug_assert_eq!(self.get_entry(index), new_entry);
 
                 let old_len = Size::from_usize(self.len());
-                self.set_len(old_len + Size(1));
+                Self::set_len_raw(self.memory, self.data, old_len + Size(1));
                 debug_assert_eq!(Size::from_usize(self.len()), old_len + Size(1));
 
                 self.sanity_check_table();
@@ -117,13 +120,15 @@ impl HashTable {
                 return true
             }
 
-            if load_data(storage, entry.key) == key {
+            if self.load_data(entry.key) == key {
                 debug_assert_eq!(hash, entry.hash);
-                delete_data(storage, allocator, entry.value);
+                self.delete_data(entry.value);
+
+                let value = self.store_data(value);
 
                 self.set_entry(index, Entry {
                     key: entry.key,
-                    value: store_data(storage, allocator, value),
+                    value,
                     hash,
                 });
 
@@ -138,15 +143,12 @@ impl HashTable {
         unreachable!("No free entry found?")
     }
 
-    pub fn remove<S: Storage>(&mut self,
-                              key: &[u8],
-                              storage: &mut S,
-                              allocator: &mut Allocator) -> bool {
+    pub fn remove(&mut self, key: &[u8]) -> bool {
         if self.len() == 0 {
             return false
         }
 
-        let table_size = self.table_size();
+        let table_size = Self::table_size(self.data);
         let hash = hash_for(key);
         let mut index = hash % table_size;
 
@@ -155,10 +157,10 @@ impl HashTable {
 
             if entry.key == EMPTY_ENTRY {
                 return false
-            } else if load_data(storage, entry.key) == key {
+            } else if self.load_data(entry.key) == key {
                 debug_assert_eq!(hash, entry.hash);
-                delete_data(storage, allocator, entry.key);
-                delete_data(storage, allocator, entry.value);
+                self.delete_data(entry.key);
+                self.delete_data(entry.value);
 
                 self.set_entry(index, Entry {
                     key: EMPTY_ENTRY,
@@ -169,7 +171,7 @@ impl HashTable {
                 self.repair_block_after_deletion(index);
 
                 let old_len = Size::from_usize(self.len());
-                self.set_len(old_len - Size(1));
+                Self::set_len_raw(self.memory, self.data, old_len - Size(1));
 
                 self.sanity_check_table();
 
@@ -181,7 +183,7 @@ impl HashTable {
     }
 
     fn repair_block_after_deletion(&mut self, deletion_index: u32) {
-        let table_size = self.table_size();
+        let table_size = Self::table_size(self.data);
         let mut search_index = advance_index(deletion_index, table_size);
 
         loop {
@@ -229,14 +231,19 @@ impl HashTable {
         }
     }
 
-    fn table_size(&self) -> u32 {
-        debug_assert_eq!((self.bytes.len() - HEADER_SIZE) % ENTRY_SIZE, 0);
-        ((self.bytes.len() - HEADER_SIZE) / ENTRY_SIZE) as u32
+    fn table_size(data: Allocation) -> u32 {
+        debug_assert_eq!((data.size - HEADER_SIZE).0 % ENTRY_SIZE.0, 0);
+        (data.size - HEADER_SIZE).0 / ENTRY_SIZE.0
     }
 
+    #[inline]
     fn get_entry(&self, index: u32) -> Entry {
-        let byte_offset = HEADER_SIZE + index as usize * ENTRY_SIZE;
-        let bytes = &self.bytes[byte_offset .. byte_offset + ENTRY_SIZE];
+        Self::get_entry_raw(self.memory, self.data, index)
+    }
+
+    fn get_entry_raw(memory: &'m Memory<S>, data: Allocation, index: u32) -> Entry {
+        let addr = data.addr + HEADER_SIZE + ENTRY_SIZE * index;
+        let bytes = memory.get_bytes(addr, ENTRY_SIZE);
 
         Entry {
             key: Address(LittleEndian::read_u32(bytes)),
@@ -245,22 +252,28 @@ impl HashTable {
         }
     }
 
+    #[inline]
     fn set_entry(&mut self, index: u32, entry: Entry) {
-        let byte_offset = HEADER_SIZE + index as usize * ENTRY_SIZE;
-        let bytes = &mut self.bytes[byte_offset .. byte_offset + ENTRY_SIZE];
+        Self::set_entry_raw(self.memory, self.data, index, entry)
+    }
+
+    fn set_entry_raw(memory: &'m mut Memory<S>, data: Allocation, index: u32, entry: Entry) {
+        let addr = data.addr + HEADER_SIZE + ENTRY_SIZE * index;
+        let bytes = memory.get_bytes_mut(addr, ENTRY_SIZE);
 
         LittleEndian::write_u32(bytes, entry.key.0);
         LittleEndian::write_u32(&mut bytes[4 ..], entry.value.0);
         LittleEndian::write_u32(&mut bytes[8 ..], entry.hash);
     }
 
-    fn resize(&mut self, new_capacity: u32) {
-        let mut new_table = HashTable::with_capacity(new_capacity as usize);
-        let new_table_size = new_table.table_size();
+    fn resize(&mut self, new_capacity: Size) {
+        let new_table_data = Self::alloc_with_capacity(self.memory, new_capacity);
+        let new_table_size = Self::table_size(new_table_data);
+        let len = self.len();
 
         let mut written = 0;
 
-        'outer: for read_index in 0 .. self.table_size() {
+        'outer: for read_index in 0 .. Self::table_size(self.data) {
             let entry = self.get_entry(read_index);
 
             if entry.key == EMPTY_ENTRY {
@@ -271,16 +284,16 @@ impl HashTable {
             let mut insertion_index = entry.hash % new_table_size;
 
             for _ in 0 .. new_table_size {
-                let new_entry = new_table.get_entry(insertion_index);
+                let new_entry = Self::get_entry_raw(self.memory, new_table_data, insertion_index);
 
                 if new_entry.key == EMPTY_ENTRY {
-                    new_table.set_entry(insertion_index, entry);
-                    debug_assert_eq!(new_table.get_entry(insertion_index), entry);
+                    Self::set_entry_raw(self.memory, new_table_data, insertion_index, entry);
+                    debug_assert_eq!(Self::get_entry_raw(self.memory, new_table_data, insertion_index), entry);
 
                     written += 1;
-                    debug_assert!(written <= self.len(),
+                    debug_assert!(written <= len,
                         "more non-null entries than len() in table. \
-                         written = {}, len={}", written, self.len());
+                         written = {}, len={}", written, len);
                     continue 'outer
                 }
 
@@ -291,15 +304,16 @@ impl HashTable {
                     old_table_size={}, new_capacity={}, new_table_size={}",
                 self.len(),
                 self.capacity(),
-                self.table_size(),
-                new_table.capacity(),
+                Self::table_size(self.data),
+                new_capacity.0,
                 new_table_size);
         }
 
-        debug_assert_eq!(written, self.len());
-        new_table.set_len(Size::from_usize(self.len()));
+        debug_assert_eq!(written, len);
+        Self::set_len_raw(self.memory, new_table_data, Size::from_usize(len));
 
-        *self = new_table;
+        self.memory.free(self.data);
+        self.data = new_table_data;
     }
 
     fn sanity_check_entry(&self, index: u32) {
@@ -308,7 +322,7 @@ impl HashTable {
             return
         }
 
-        let table_size = self.table_size();
+        let table_size = Self::table_size(self.data);
 
         let min_entry_index = entry.hash % table_size;
 
@@ -330,20 +344,42 @@ impl HashTable {
     }
 
     pub fn sanity_check_table(&self) {
-        for index in 0 .. self.table_size() {
+        for index in 0 .. Self::table_size(self.data) {
             self.sanity_check_entry(index);
         }
     }
 
-    pub fn iter<S: Storage, F: FnMut(&[u8], &[u8])>(&self, storage: &S, mut f: F) {
-        let table_size = self.table_size();
+    pub fn iter<F: FnMut(&[u8], &[u8])>(&self, mut f: F) {
+        let table_size = Self::table_size(self.data);
         for index in 0 .. table_size {
             let entry = self.get_entry(index);
 
             if entry.key != EMPTY_ENTRY {
-                f(load_data(storage, entry.key), load_data(storage, entry.value));
+                f(self.load_data(entry.key), self.load_data(entry.value));
             }
         }
+    }
+
+    fn store_data(&mut self, key: &[u8]) -> Address {
+        assert!(key.len() < 256);
+
+        let allocation = self.memory.alloc(Size::from_usize(key.len() + 1));
+        self.memory.write_bytes(allocation.addr, &[key.len() as u8]);
+        self.memory.write_bytes(allocation.addr + Size(1), key);
+        allocation.addr
+    }
+
+    fn load_data(&self, addr: Address) -> &[u8] {
+        let len = self.memory.get_bytes(addr, Size(1))[0] as u32;
+        self.memory.get_bytes(addr + Size(1), Size(len))
+    }
+
+    fn delete_data(&mut self, addr: Address) {
+        let len = self.memory.get_bytes(addr, Size(1))[0] as u32;
+        self.memory.free(Allocation {
+            addr,
+            size: Size(len + 1),
+        });
     }
 }
 
@@ -355,8 +391,8 @@ struct Entry {
 }
 
 #[inline]
-fn byte_count_for_capacity(capacity: usize) -> usize {
-    HEADER_SIZE + ENTRY_SIZE * capacity * 2
+fn byte_count_for_capacity(capacity: Size) -> Size {
+    HEADER_SIZE + ENTRY_SIZE * capacity * 2u32
 }
 
 #[inline]
@@ -374,67 +410,36 @@ fn advance_index(index: u32, table_size: u32) -> u32 {
     (index + 1) % table_size
 }
 
-fn store_data<S: Storage>(storage: &mut S, allocator: &mut Allocator, key: &[u8]) -> Address {
-    assert!(key.len() < 256);
-
-    let allocation = allocator.alloc(Size::from_usize(key.len() + 1));
-    storage.write_bytes(allocation.addr, &[key.len() as u8]);
-    storage.write_bytes(allocation.addr + Size(1), key);
-    allocation.addr
-}
-
-fn load_data<S: Storage>(storage: &S, addr: Address) -> &[u8] {
-    let len = storage.get_bytes(addr, Size(1))[0] as u32;
-    storage.get_bytes(addr + Size(1), Size(len))
-}
-
-fn delete_data<S: Storage>(_storage: &mut S,
-                           allocator: &mut Allocator,
-                           addr: Address) {
-    allocator.free(addr);
-}
-
-pub struct ReadView<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> ReadView<'a> {
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        LittleEndian::read_u32(&self.bytes[LEN_OFFSET..]) as usize
-    }
-
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        LittleEndian::read_u32(&self.bytes[CAPACITY_OFFSET..]) as usize
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use MemStore;
+
+    fn create_memory(size: usize) -> Memory<MemStore> {
+        let mut memory = Memory::new(MemStore::new(size));
+
+        memory.alloc(Size(1));
+
+        memory
+    }
 
     #[test]
     fn test_new() {
-        let hash_table = HashTable::new();
+        let mut memory = create_memory(100);
+        let hash_table = HashTable::new(&mut memory);
         assert_eq!(hash_table.len(), 0);
-        assert_eq!(hash_table.read_view().len(), 0);
-
         assert_eq!(hash_table.capacity(), 0);
-        assert_eq!(hash_table.read_view().capacity(), 0);
 
         hash_table.sanity_check_table();
     }
 
     #[test]
     fn test_with_capacity() {
-        let hash_table = HashTable::with_capacity(100);
+        let mut memory = create_memory(10000);
+        let hash_table = HashTable::with_capacity(&mut memory, Size(100));
         assert_eq!(hash_table.len(), 0);
-        assert_eq!(hash_table.read_view().len(), 0);
-
         assert_eq!(hash_table.capacity(), 100);
-        assert_eq!(hash_table.read_view().capacity(), 100);
 
         hash_table.sanity_check_table();
     }
