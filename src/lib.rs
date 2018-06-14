@@ -2,119 +2,25 @@
 extern crate byteorder;
 extern crate metrohash;
 
+#[macro_use]
+extern crate bitflags;
+
 #[cfg(test)]
 extern crate rand;
 
 use std::collections::HashSet;
 
 mod buffer;
-mod address;
+mod memory;
 mod allocator;
 mod hashtable;
+mod header;
 
-pub use address::{Address, Size};
+pub use memory::{Address, Size, Memory, Storage, MemStore};
 pub use buffer::{Buffer, BufferProvider};
 pub use allocator::{Allocator, Allocation};
 pub use hashtable::HashTable;
 
-pub trait Storage {
-    fn size(&self) -> Size;
-    fn write_bytes(&mut self, addr: Address, b: &[u8]);
-    fn get_bytes(&self, addr: Address, len: Size) -> &[u8];
-    fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8];
-
-}
-
-pub struct Memory<S: Storage> {
-    storage: S,
-    allocator: Allocator,
-}
-
-impl<S: Storage> Memory<S> {
-
-    #[inline]
-    pub fn new(storage: S) -> Memory<S> {
-        Memory {
-            allocator: Allocator::new(storage.size()),
-            storage,
-        }
-    }
-
-    #[inline]
-    pub fn new_with_allocator(storage: S, allocator: Allocator) -> Memory<S> {
-        assert!(storage.size() >= allocator.total_size());
-
-        Memory {
-            allocator,
-            storage,
-        }
-    }
-
-    #[inline]
-    pub fn write_bytes(&mut self, addr: Address, b: &[u8]) {
-        self.storage.write_bytes(addr, b);
-    }
-
-    #[inline]
-    pub fn get_bytes(&self, addr: Address, len: Size) -> &[u8] {
-        self.storage.get_bytes(addr, len)
-    }
-
-    #[inline]
-    pub fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8] {
-        self.storage.get_bytes_mut(addr, len)
-    }
-
-    #[inline]
-    pub fn alloc(&mut self, size: Size) -> Allocation {
-        self.allocator.alloc(size)
-    }
-
-    #[inline]
-    pub fn free(&mut self, allocation: Allocation) {
-        for b in self.storage.get_bytes_mut(allocation.addr, allocation.size) {
-            *b = 0;
-        }
-        self.allocator.free(allocation);
-    }
-}
-
-pub struct MemStore {
-    data: Vec<u8>,
-}
-
-impl MemStore {
-    pub fn new(size: usize) -> MemStore {
-        MemStore {
-            data: vec![0u8; size],
-        }
-    }
-}
-
-impl Storage for MemStore {
-    #[inline]
-    fn size(&self) -> Size {
-        Size::from_usize(self.data.len())
-    }
-
-    #[inline]
-    fn write_bytes(&mut self, addr: Address, b: &[u8]) {
-        let start = addr.0 as usize;
-        let end = start + b.len();
-
-        self.data[start .. end].copy_from_slice(b);
-    }
-
-    #[inline]
-    fn get_bytes(&self, addr: Address, len: Size) -> &[u8] {
-        &self.data[addr.0 as usize .. (addr + len).0 as usize]
-    }
-
-    #[inline]
-    fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8] {
-        &mut self.data[addr.0 as usize .. (addr + len).0 as usize]
-    }
-}
 
 pub struct Encoder<'buf, 'db, S: Storage + 'db> {
     db: &'db mut Database<S>,

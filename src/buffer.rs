@@ -1,5 +1,5 @@
 
-use address::Size;
+use memory::Size;
 
 pub struct Buffer<'data> {
     data: &'data mut Vec<u8>,
