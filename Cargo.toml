@@ -6,6 +6,7 @@ authors = ["Michael Woerister <michaelwoerister@posteo>"]
 [dependencies]
 byteorder = "1"
 metrohash = "1"
+bitflags = "1"
 
 [dev-dependencies]
 rand = "0.5"
