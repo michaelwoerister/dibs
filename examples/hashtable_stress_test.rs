@@ -10,7 +10,7 @@ fn main() {
     let mut memory = create_memory();
 
     let mut reference = HashMap::new();
-    let mut table = HashTable::new(&mut memory);
+    let mut table: HashTable<_, DefaultHashTableConfig> = HashTable::new(&mut memory);
 
     let mut next_table_size_to_report = 100;
 

@@ -21,12 +21,12 @@ pub struct Header {
     footer_addr: Address,
 }
 
-pub fn read_header<S: Storage>(memory: &Memory<S>) -> Result<Header, String> {
-    if memory.size() < Size::from_usize(mem::size_of::<Header>()) {
+pub fn read_header<S: Storage>(storage: &S) -> Result<Header, String> {
+    if storage.size() < Size::from_usize(mem::size_of::<Header>()) {
         return Err("File too small".to_string());
     }
 
-    let header_bytes = memory.get_bytes(Address(0), Size::from_usize(mem::size_of::<Header>()));
+    let header_bytes = storage.get_bytes(Address(0), Size::from_usize(mem::size_of::<Header>()));
 
     if &header_bytes[0 .. 4] != FILE_MAGIC {
         return Err(format!("File magic does not match."));
@@ -49,7 +49,7 @@ pub fn read_header<S: Storage>(memory: &Memory<S>) -> Result<Header, String> {
 
     let footer_addr = Address(LittleEndian::read_u32(&header_bytes[12 .. 16]));
 
-    if footer_addr >= Address::from_u32(0) + memory.size() {
+    if footer_addr >= Address::from_u32(0) + storage.size() {
         return Err(format!("File footer addr outside of file"));
     }
 
@@ -63,7 +63,7 @@ pub fn read_header<S: Storage>(memory: &Memory<S>) -> Result<Header, String> {
     Ok(header)
 }
 
-pub fn write_header<S: Storage>(memory: &mut Memory<S>,
+pub fn write_header<S: Storage>(storage: &mut S,
                                 supports_gc: bool,
                                 footer_addr: Address) {
     let mut flags = Flags::empty();
@@ -72,10 +72,17 @@ pub fn write_header<S: Storage>(memory: &mut Memory<S>,
         flags |= Flags::SUPPORTS_GC;
     }
 
-    let header_bytes = memory.get_bytes_mut(Address(0), Size::from_usize(mem::size_of::<Header>()));
+    let header_bytes = storage.get_bytes_mut(Address(0), Size::from_usize(mem::size_of::<Header>()));
 
     header_bytes[0..4].copy_from_slice(&FILE_MAGIC);
     LittleEndian::write_u32(&mut header_bytes[ 4 ..  8], FILE_FORMAT_VERSION);
     LittleEndian::write_u32(&mut header_bytes[ 8 .. 12], flags.bits());
     LittleEndian::write_u32(&mut header_bytes[12 .. 16], footer_addr.as_u32());
+}
+
+pub fn reserve_header<S: Storage>(memory: &mut Memory<S>) {
+    let header_size = Size::from_usize(mem::size_of::<Header>());
+    let alloc = memory.alloc(header_size);
+    assert_eq!(alloc.addr, Address::from_u32(0));
+    assert_eq!(alloc.size, header_size);
 }

@@ -1,8 +1,7 @@
 
 
-use super::{Size, Address};
-
-// const MIN_ALLOC_SIZE: Size = Size(8);
+use memory::{Storage, Address, Size};
+use persist::{Serialize, StorageWriter};
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct Allocation {
@@ -19,15 +18,29 @@ impl Allocation {
         }
     }
 
-    fn start(&self) -> Address {
+    #[inline]
+    pub fn start(&self) -> Address {
         self.addr
     }
 
-    fn end(&self) -> Address {
+    #[inline]
+    pub fn end(&self) -> Address {
         self.addr + self.size
     }
 }
 
+impl Serialize for Allocation {
+    #[inline]
+    fn write<'s, S: Storage + 's>(&self, writer: &mut StorageWriter<'s, S>) {
+        let Allocation {
+            addr,
+            size,
+        } = *self;
+
+        addr.write(writer);
+        size.write(writer);
+    }
+}
 
 pub struct Allocator {
     allocations: Vec<Allocation>,
@@ -52,6 +65,11 @@ impl Allocator {
         self.total_size
     }
 
+    pub fn max_addr(&self) -> Address {
+        let last_allocation = self.allocations.last().unwrap();
+        last_allocation.end()
+    }
+
     pub fn alloc(&mut self, size: Size) -> Allocation {
         assert!(size != Size(0));
 
@@ -70,33 +88,25 @@ impl Allocator {
 
                 let available_alloc = self.free_by_size[index];
                 assert!(available_alloc.size >= size);
+
+                self.free_by_size.remove(index);
                 let remaining_space = available_alloc.size - size;
-
-                // if remaining_space < MIN_ALLOC_SIZE {
-                //     self.free_by_size.remove(index);
-                //     self.remove_free_by_addr(available_alloc);
-                //     self.insert_alloc(available_alloc);
-                //     available_alloc
-                // } else
-                {
-                    self.free_by_size.remove(index);
-                    let remaining_free_alloc = Allocation::new(available_alloc.start() + size, remaining_space);
-                    self.insert_free_by_size(remaining_free_alloc);
-                    match self.find_free_by_address(available_alloc.addr) {
-                        Ok(index) => {
-                            self.free_by_addr[index] = remaining_free_alloc;
-                            self.assert_order_free_by_addr(index);
-                        }
-                        Err(_) => {
-                            panic!("Mismatch between alloc_by_size and alloc_by_addr.")
-                        }
+                let remaining_free_alloc = Allocation::new(available_alloc.start() + size, remaining_space);
+                self.insert_free_by_size(remaining_free_alloc);
+                match self.find_free_by_address(available_alloc.addr) {
+                    Ok(index) => {
+                        self.free_by_addr[index] = remaining_free_alloc;
+                        self.assert_order_free_by_addr(index);
                     }
-
-                    let new_alloc = Allocation::new(available_alloc.start(), size);
-                    assert_eq!(new_alloc.end(), available_alloc.start() + size);
-                    self.insert_alloc(new_alloc);
-                    new_alloc
+                    Err(_) => {
+                        panic!("Mismatch between alloc_by_size and alloc_by_addr.")
+                    }
                 }
+
+                let new_alloc = Allocation::new(available_alloc.start(), size);
+                assert_eq!(new_alloc.end(), available_alloc.start() + size);
+                self.insert_alloc(new_alloc);
+                new_alloc
             }
         }
     }
@@ -262,6 +272,23 @@ impl Allocator {
         if index < self.free_by_addr.len() - 1 {
             assert!(self.free_by_addr[index + 1].addr > self.free_by_addr[index].addr)
         }
+    }
+}
+
+impl Serialize for Allocator {
+    #[inline]
+    fn write<'s, S: Storage + 's>(&self, writer: &mut StorageWriter<'s, S>) {
+        let Allocator {
+            ref allocations,
+            ref free_by_addr,
+            ref free_by_size,
+            total_size,
+        } = *self;
+
+        allocations.write(writer);
+        free_by_addr.write(writer);
+        free_by_size.write(writer);
+        total_size.write(writer);
     }
 }
 

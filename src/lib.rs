@@ -9,18 +9,22 @@ extern crate bitflags;
 extern crate rand;
 
 use std::collections::HashSet;
+use std::mem;
 
-mod buffer;
-mod memory;
 mod allocator;
+mod buffer;
+mod footer;
 mod hashtable;
 mod header;
+mod memory;
+mod persist;
+mod record;
 
-pub use memory::{Address, Size, Memory, Storage, MemStore};
-pub use buffer::{Buffer, BufferProvider};
 pub use allocator::{Allocator, Allocation};
-pub use hashtable::HashTable;
-
+pub use buffer::{Buffer, BufferProvider};
+pub use hashtable::{HashTable, HashTableConfig, DefaultHashTableConfig};
+pub use memory::{Address, Size, Memory, Storage, MemStore};
+use record::{Record, RecordId};
 
 pub struct Encoder<'buf, 'db, S: Storage + 'db> {
     db: &'db mut Database<S>,
@@ -61,9 +65,9 @@ impl<'buf, 'db, S: Storage + 'db> Encoder<'buf, 'db, S> {
         } = encoder;
 
         let record_size = buffer.len();
-        let allocation = db.alloc.alloc(record_size);
+        let allocation = db.memory.alloc(record_size);
 
-        db.storage.write_bytes(allocation.addr, buffer.bytes());
+        db.memory.write_bytes(allocation.addr, buffer.bytes());
 
         {
             let record = &mut db.records[record_id.idx()];
@@ -81,39 +85,6 @@ impl<'buf, 'db, S: Storage + 'db> Encoder<'buf, 'db, S> {
     }
 }
 
-// TODO: non-zero
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-pub struct RecordId(u32);
-
-impl RecordId {
-    #[inline(always)]
-    fn idx(self) -> usize {
-        self.0 as usize
-    }
-
-    #[inline(always)]
-    fn from_usize(idx: usize) -> RecordId {
-        assert!(idx <= ::std::u32::MAX as usize);
-        RecordId(idx as u32)
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
-struct Record {
-    addr: Address,
-    size: Size,
-    ref_count: u32,
-}
-
-impl Record {
-    fn null() -> Record {
-        Record {
-            addr: Address(0),
-            size: Size(0),
-            ref_count: 0,
-        }
-    }
-}
 
 pub struct CurrentRecordId {
     record_id: RecordId,
@@ -130,21 +101,21 @@ impl CurrentRecordId {
 }
 
 pub struct Database<S: Storage> {
-    storage: S,
+    memory: Memory<S>,
     record_id_free_list: Vec<RecordId>,
     records: Vec<Record>,
-    alloc: Allocator,
     buffer_providers: Vec<BufferProvider>,
 }
 
 impl<S: Storage> Database<S> {
 
-    pub fn new(storage: S) -> Database<S> {
+    pub fn init(mut memory: Memory<S>) -> Database<S> {
+        header::reserve_header(&mut memory);
+
         Database {
-            storage,
+            memory,
             record_id_free_list: Vec::new(),
             records: Vec::new(),
-            alloc: Allocator::new(Size(0)),
             buffer_providers: Vec::new(),
         }
     }
@@ -161,7 +132,7 @@ impl<S: Storage> Database<S> {
 
     pub fn get_record(&self, record_id: RecordId) -> &[u8] {
         let record = &self.records[record_id.idx()];
-        self.storage.get_bytes(record.addr, record.size)
+        self.memory.get_bytes(record.addr, record.size)
     }
 
     pub fn write_record<W>(&mut self, w: W) -> RecordId
@@ -187,15 +158,26 @@ impl<S: Storage> Database<S> {
 
     pub fn delete_record(&mut self, record_id: RecordId) {
         let record = self.records[record_id.idx()];
-        self.alloc.free(Allocation::new(record.addr, record.size));
+        self.memory.free(Allocation::new(record.addr, record.size));
         self.records[record_id.idx()] = Record::null();
         self.record_id_free_list.push(record_id);
+    }
+
+    pub fn persist(self) {
+        mem::drop(self);
     }
 }
 
 impl<S: Storage> Drop for Database<S> {
     fn drop(&mut self) {
 
+        // Find footer address
+        let footer_addr = self.memory.allocator.max_addr();
+
+        // Write footer
+        footer::write_footer(&mut self.memory.storage, footer_addr, &self.memory.allocator);
+
+        header::write_header(&mut self.memory.storage, false, footer_addr);
     }
 }
 

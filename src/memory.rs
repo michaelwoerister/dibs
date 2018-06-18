@@ -1,6 +1,7 @@
 
 use allocator::{Allocator, Allocation};
 use std::ops::{Add, AddAssign, Sub, Mul};
+use persist::{Serialize, Deserialize, StorageWriter, StorageReader};
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct Address(pub u32);
@@ -13,11 +14,12 @@ pub trait Storage {
     fn write_bytes(&mut self, addr: Address, b: &[u8]);
     fn get_bytes(&self, addr: Address, len: Size) -> &[u8];
     fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8];
+    fn copy_nonoverlapping(&mut self, src: Address, dst: Address, len: Size);
 }
 
 pub struct Memory<S: Storage> {
-    storage: S,
-    allocator: Allocator,
+    pub(crate) storage: S,
+    pub(crate) allocator: Allocator,
 }
 
 impl<S: Storage> Memory<S> {
@@ -67,10 +69,35 @@ impl<S: Storage> Memory<S> {
 
     #[inline]
     pub fn free(&mut self, allocation: Allocation) {
-        for b in self.storage.get_bytes_mut(allocation.addr, allocation.size) {
-            *b = 0;
-        }
+        fill_zero(self.storage.get_bytes_mut(allocation.addr, allocation.size));
         self.allocator.free(allocation);
+    }
+}
+
+impl<S: Storage> Storage for Memory<S> {
+    #[inline]
+    fn size(&self) -> Size {
+        self.storage.size()
+    }
+
+    #[inline]
+    fn write_bytes(&mut self, addr: Address, b: &[u8]) {
+        self.storage.write_bytes(addr, b);
+    }
+
+    #[inline]
+    fn get_bytes(&self, addr: Address, len: Size) -> &[u8] {
+        self.storage.get_bytes(addr, len)
+    }
+
+    #[inline]
+    fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8] {
+        self.storage.get_bytes_mut(addr, len)
+    }
+
+    #[inline]
+    fn copy_nonoverlapping(&mut self, src: Address, dst: Address, len: Size) {
+        self.storage.copy_nonoverlapping(src, dst, len);
     }
 }
 
@@ -109,6 +136,21 @@ impl Storage for MemStore {
     fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8] {
         &mut self.data[addr.0 as usize .. (addr + len).0 as usize]
     }
+
+    #[inline]
+    fn copy_nonoverlapping(&mut self, src: Address, dst: Address, len: Size) {
+        #[cfg(debug_assertions)]
+        {
+            // TODO assert non-overlapping
+        }
+
+        // TODO: safe implementation
+        unsafe {
+            let src = self.data[src.as_usize()..].as_ptr();
+            let dst = self.data[dst.as_usize()..].as_mut_ptr();
+            ::std::ptr::copy_nonoverlapping(src, dst, len.as_usize());
+        }
+    }
 }
 
 
@@ -119,6 +161,13 @@ impl Add<Size> for Address {
     #[inline]
     fn add(self, rhs: Size) -> Self::Output {
         Address(self.0 + rhs.0)
+    }
+}
+
+impl AddAssign<Size> for Address {
+    #[inline]
+    fn add_assign(&mut self, rhs: Size) {
+        self.0 += rhs.0;
     }
 }
 
@@ -198,6 +247,21 @@ impl Address {
     }
 }
 
+impl Serialize for Address {
+    #[inline]
+    fn write<'s, S: Storage + 's>(&self, writer: &mut StorageWriter<'s, S>) {
+        writer.write_u32(self.0);
+    }
+}
+
+impl Deserialize for Address {
+    #[inline]
+    fn read<'s, S: Storage + 's>(reader: &mut StorageReader<'s, S>) -> Address {
+        Address(reader.read_u32())
+    }
+}
+
+
 impl Size {
     #[inline]
     pub fn from_usize(x: usize) -> Size {
@@ -219,5 +283,26 @@ impl Size {
     #[inline]
     pub fn as_u32(self) -> u32 {
         self.0
+    }
+}
+
+impl Serialize for Size {
+    #[inline]
+    fn write<'s, S: Storage + 's>(&self, writer: &mut StorageWriter<'s, S>) {
+        writer.write_u32(self.0);
+    }
+}
+
+impl Deserialize for Size {
+    #[inline]
+    fn read<'s, S: Storage + 's>(reader: &mut StorageReader<'s, S>) -> Size {
+        Size(reader.read_u32())
+    }
+}
+
+#[inline]
+pub fn fill_zero(slice: &mut [u8]) {
+    for b in slice {
+        *b = 0;
     }
 }
