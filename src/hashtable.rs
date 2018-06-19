@@ -1,9 +1,73 @@
 
 use std::mem;
+use std::marker::PhantomData;
 use byteorder::{LittleEndian, ByteOrder};
 use allocator::Allocation;
 use persist::*;
 use memory::*;
+
+pub struct HashTable<'m, S: Storage + 'm, C: HashTableConfig = DefaultHashTableConfig> {
+    data: Allocation,
+    memory: &'m mut Memory<S>,
+    config: PhantomData<C>,
+}
+
+impl<'m, S: Storage + 'm, C: HashTableConfig> HashTable<'m, S, C> {
+
+    #[inline]
+    pub fn new(memory: &'m mut Memory<S>) -> HashTable<'m, S, C> {
+        HashTable::with_capacity(memory, Size(0))
+    }
+
+    #[inline]
+    pub fn with_capacity(memory: &'m mut Memory<S>, capacity: Size) -> HashTable<'m, S, C> {
+        let data = RawTable::<S, C>::alloc_with_capacity(memory, capacity);
+
+        HashTable {
+            data,
+            memory,
+            config: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        RawTable::<S, C>::len(self.memory, self.data).as_usize()
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        RawTable::<S, C>::capacity(self.memory, self.data).as_usize()
+    }
+
+    pub fn find(&self, key: &[u8]) -> Option<&[u8]> {
+        RawTable::<S, C>::find(self.memory, self.data, key)
+    }
+
+    pub fn insert(&mut self, key: &[u8], value: &[u8]) -> bool {
+        RawTable::<S, C>::insert(self.memory, &mut self.data, key, value)
+    }
+
+    #[inline]
+    pub fn remove(&mut self, key: &[u8]) -> bool {
+        RawTable::<S, C>::remove_entry(self.memory, self.data, key)
+    }
+
+    #[inline]
+    pub fn delete_table(self) {
+        RawTable::<S, C>::delete_table(self.memory, self.data);
+    }
+
+    pub fn sanity_check_table(&self) {
+        RawTable::<S, C>::sanity_check_table(self.memory, self.data);
+    }
+
+    pub fn iter<F: FnMut(&[u8], &[u8])>(&self, f: F) {
+        RawTable::<S, C>::iter(self.memory, self.data, f);
+    }
+}
+
+
 
 const MAGIC_HEADER: [u8; 4] = [b'H', b'A', b'S', b'H'];
 
@@ -14,23 +78,23 @@ const CAPACITY_OFFSET: Size = Size(LEN_OFFSET.0 + 4);
 const HEADER_SIZE: Size = Size(CAPACITY_OFFSET.0 + 4);
 const ENTRY_META_SIZE: Size = Size(8);
 
-// TODO: support deleting table
-
 // Layout:
 //
 // magic_header: u32
 // item_count: u32
 // capacity: u32
 // entry*
-pub struct HashTable<'m, S: Storage + 'm, C: HashTableConfig = DefaultHashTableConfig> {
-    data: Allocation,
-    memory: &'m mut Memory<S>,
-    config: ::std::marker::PhantomData<C>,
+pub struct RawTable<S: Storage, C: HashTableConfig = DefaultHashTableConfig> {
+    memory: PhantomData<S>,
+    config: PhantomData<C>,
 }
 
 pub trait HashTableConfig {
     const MAX_INLINE_KEY_LEN: Size = Size(4);
     const MAX_INLINE_VALUE_LEN: Size = Size(4);
+    const ENTRY_SIZE: Size = Size(Self::MAX_INLINE_KEY_LEN.0 +
+                                  Self::MAX_INLINE_VALUE_LEN.0 +
+                                  ENTRY_META_SIZE.0);
 }
 
 pub enum DefaultHashTableConfig {}
@@ -88,8 +152,8 @@ impl EntryDataKind for DataKindValue {
 struct Entry<C: HashTableConfig, S: Storage> {
     metadata: u64,
     addr: Address,
-    config: ::std::marker::PhantomData<C>,
-    storage: ::std::marker::PhantomData<S>,
+    config: PhantomData<C>,
+    storage: PhantomData<S>,
 }
 
 impl<C: HashTableConfig, S: Storage> Entry<C, S> {
@@ -104,7 +168,7 @@ impl<C: HashTableConfig, S: Storage> Entry<C, S> {
         debug_assert!(!self.is_empty());
         self.delete_entry_data::<DataKindKey>(memory);
         self.delete_entry_data::<DataKindValue>(memory);
-        fill_zero(memory.get_bytes_mut(self.addr, HashTable::<S, C>::ENTRY_SIZE));
+        fill_zero(memory.get_bytes_mut(self.addr, C::ENTRY_SIZE));
         self.metadata = 0;
         debug_assert!(self.is_empty());
     }
@@ -197,7 +261,7 @@ impl<C: HashTableConfig, S: Storage> Entry<C, S> {
         debug_assert_eq!(self.entry_data::<K>(memory), bytes);
     }
 
-    // Don't use this directly, just a helper function for clear() and set_entry_data_raw()
+    // Don't use this directly, just a helper function for clear() and set_entry_data()
     fn delete_entry_data<K: EntryDataKind>(&mut self, memory: &mut Memory<S>) {
         let data_addr = self.addr + K::offset_within_entry::<C>();
 
@@ -213,27 +277,9 @@ impl<C: HashTableConfig, S: Storage> Entry<C, S> {
     }
 }
 
+impl<S: Storage, C: HashTableConfig> RawTable<S, C> {
 
-impl<'m, S: Storage + 'm, C: HashTableConfig> HashTable<'m, S, C> {
-
-    const ENTRY_SIZE: Size = Size(C::MAX_INLINE_KEY_LEN.0 + C::MAX_INLINE_VALUE_LEN.0 + ENTRY_META_SIZE.0);
-
-    #[inline]
-    pub fn new(memory: &'m mut Memory<S>) -> HashTable<'m, S, C> {
-        HashTable::with_capacity(memory, Size(0))
-    }
-
-    pub fn with_capacity(memory: &'m mut Memory<S>, capacity: Size) -> HashTable<'m, S, C> {
-        let data = Self::alloc_with_capacity(memory, capacity);
-
-        HashTable {
-            data,
-            memory,
-            config: ::std::marker::PhantomData,
-        }
-    }
-
-    fn alloc_with_capacity(memory: &'m mut Memory<S>, capacity: Size) -> Allocation {
+    fn alloc_with_capacity(memory: &mut Memory<S>, capacity: Size) -> Allocation {
         let byte_count = Self::byte_count_for_capacity(capacity);
         let data = memory.alloc(byte_count);
 
@@ -242,77 +288,68 @@ impl<'m, S: Storage + 'm, C: HashTableConfig> HashTable<'m, S, C> {
             memory.get_bytes_mut(data.addr, Size(4)).copy_from_slice(&MAGIC_HEADER);
         }
 
-        Self::set_len_raw(memory, data, Size(0));
-        Self::set_capacity_raw(memory, data, capacity);
-        assert!((byte_count - HEADER_SIZE).as_u32() % Self::ENTRY_SIZE.as_u32() == 0);
+        Self::set_len(memory, data, Size(0));
+        Self::set_capacity(memory, data, capacity);
+        assert!((byte_count - HEADER_SIZE).as_u32() % C::ENTRY_SIZE.as_u32() == 0);
 
         data
     }
 
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        Self::len_raw(self.memory, self.data).as_usize()
-    }
-
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        Self::capacity_raw(self.memory, self.data).as_usize()
-    }
-
-    pub fn find(&self, key: &[u8]) -> Option<&[u8]> {
-        let table_size = Self::entry_array_len_raw(self.memory, self.data);
+    fn find<'m>(memory: &'m Memory<S>, table_data: Allocation, key: &[u8]) -> Option<&'m [u8]> {
+        let table_size = Self::entry_array_len(memory, table_data);
         let hash = hash_for(key);
         let mut entry_index = index_in_table(hash, table_size);
 
         loop {
-            let entry = Self::get_entry_raw(self.memory, self.data, entry_index);
+            let entry = Self::get_entry(memory, table_data, entry_index);
 
             if entry.is_empty() {
                 return None
             } else if entry.hash_equal(hash) &&
-                      entry.entry_data::<DataKindKey>(self.memory) == key {
-                return Some(entry.entry_data::<DataKindValue>(self.memory))
+                      entry.entry_data::<DataKindKey>(memory) == key {
+                return Some(entry.entry_data::<DataKindValue>(memory))
             }
 
             entry_index = advance_index(entry_index, table_size);
         }
     }
 
-    pub fn insert(&mut self, key: &[u8], value: &[u8]) -> bool {
-        if self.len() >= self.capacity() {
-            let new_capacity = if self.capacity() == 0 {
-                8
+    pub fn insert(memory: &mut Memory<S>, table_data: &mut Allocation, key: &[u8], value: &[u8]) -> bool {
+        let initial_capacity = Self::capacity(memory, *table_data);
+        if Self::len(memory, *table_data) >= initial_capacity {
+            let new_capacity = if initial_capacity == Size(0) {
+                Size(8)
             } else {
-                (self.capacity() * 3) / 2
+                (initial_capacity * 3u32) / 2u32
             };
-            self.resize(Size::from_usize(new_capacity));
+            debug_assert!(new_capacity > Size(0));
+            Self::resize(memory, table_data, new_capacity);
         }
 
-        let table_size = Self::entry_array_len_raw(self.memory, self.data);
+        let table_size = Self::entry_array_len(memory, *table_data);
         let hash = hash_for(key);
         let mut entry_index = index_in_table(hash, table_size);
         let mut key_added = false;
 
         for _ in 0 .. table_size {
-            let mut entry = Self::get_entry_raw(self.memory, self.data, entry_index);
+            let mut entry = Self::get_entry(memory, *table_data, entry_index);
 
             if entry.is_empty() {
-                entry.init_non_empty(self.memory, hash);
-                entry.set_entry_data::<DataKindKey>(self.memory, key);
-                entry.set_entry_data::<DataKindValue>(self.memory, value);
+                entry.init_non_empty(memory, hash);
+                entry.set_entry_data::<DataKindKey>(memory, key);
+                entry.set_entry_data::<DataKindValue>(memory, value);
 
-                let old_len = Size::from_usize(self.len());
-                Self::set_len_raw(self.memory, self.data, old_len + Size(1));
-                debug_assert_eq!(Size::from_usize(self.len()), old_len + Size(1));
+                let old_len = Self::len(memory, *table_data);
+                Self::set_len(memory, *table_data, old_len + Size(1));
+                debug_assert_eq!(Self::len(memory, *table_data), old_len + Size(1));
                 key_added = true;
                 break
             }
 
             if entry.hash_equal(hash) &&
-               entry.entry_data::<DataKindKey>(self.memory) == key {
+               entry.entry_data::<DataKindKey>(memory) == key {
                 debug_assert!(!entry.is_empty());
-                entry.set_entry_data::<DataKindValue>(self.memory, value);
+                entry.set_entry_data::<DataKindValue>(memory, value);
                 break
             }
 
@@ -321,40 +358,53 @@ impl<'m, S: Storage + 'm, C: HashTableConfig> HashTable<'m, S, C> {
 
         #[cfg(debug_assertions)]
         {
-            let actual_entry = Self::get_entry_raw(self.memory, self.data, entry_index);
+            let actual_entry = Self::get_entry(memory, *table_data, entry_index);
             assert!(actual_entry.hash_equal(hash));
             assert!(!actual_entry.is_empty());
-            assert_eq!(actual_entry.entry_data::<DataKindKey>(self.memory), key);
-            assert_eq!(actual_entry.entry_data::<DataKindValue>(self.memory), value);
-            assert_eq!(self.find(key), Some(value));
-            self.sanity_check_entry(entry_index);
+            assert_eq!(actual_entry.entry_data::<DataKindKey>(memory), key);
+            assert_eq!(actual_entry.entry_data::<DataKindValue>(memory), value);
+            assert_eq!(Self::find(memory, *table_data, key), Some(value));
+            Self::sanity_check_entry(memory, *table_data, entry_index);
         }
 
         key_added
     }
 
-    pub fn remove(&mut self, key: &[u8]) -> bool {
-        if self.len() == 0 {
+    fn delete_table(memory: &mut Memory<S>, table_data: Allocation) {
+        let table_size = Self::entry_array_len(memory, table_data);
+
+        for entry_index in 0 .. table_size {
+            let mut entry = Self::get_entry(memory, table_data, entry_index);
+            if !entry.is_empty() {
+                entry.clear(memory);
+            }
+        }
+
+        memory.free(table_data);
+    }
+
+    fn remove_entry(memory: &mut Memory<S>, table_data: Allocation, key: &[u8]) -> bool {
+        if Self::len(memory, table_data) == Size(0) {
             return false
         }
 
-        let table_size = Self::entry_array_len_raw(self.memory, self.data);
+        let table_size = Self::entry_array_len(memory, table_data);
         let hash = hash_for(key);
         let mut index = index_in_table(hash, table_size);
 
         loop {
-            let mut entry = Self::get_entry_raw(self.memory, self.data, index);
+            let mut entry = Self::get_entry(memory, table_data, index);
 
             if entry.is_empty() {
                 return false
             } else if entry.hash_equal(hash) &&
-                      entry.entry_data::<DataKindKey>(self.memory) == key {
-                entry.clear(self.memory);
+                      entry.entry_data::<DataKindKey>(memory) == key {
+                entry.clear(memory);
 
-                self.repair_block_after_deletion(index);
+                Self::repair_block_after_deletion(memory, table_data, index);
 
-                let old_len = Size::from_usize(self.len());
-                Self::set_len_raw(self.memory, self.data, old_len - Size(1));
+                let old_len = Self::len(memory, table_data);
+                Self::set_len(memory, table_data, old_len - Size(1));
 
                 return true
             }
@@ -363,13 +413,13 @@ impl<'m, S: Storage + 'm, C: HashTableConfig> HashTable<'m, S, C> {
         }
     }
 
-    fn repair_block_after_deletion(&mut self, deletion_index: u32) {
-        let table_size = Self::entry_array_len_raw(self.memory, self.data);
+    fn repair_block_after_deletion(memory: &mut Memory<S>, table_data: Allocation, deletion_index: u32) {
+        let table_size = Self::entry_array_len(memory, table_data);
 
         let mut search_index = advance_index(deletion_index, table_size);
 
         loop {
-            let search_entry = Self::get_entry_raw(self.memory, self.data, search_index);
+            let search_entry = Self::get_entry(memory, table_data, search_index);
 
             if search_entry.is_empty() {
                 // nothing to do
@@ -380,14 +430,14 @@ impl<'m, S: Storage + 'm, C: HashTableConfig> HashTable<'m, S, C> {
 
             if search_index > min_entry_index {
                 if deletion_index >= min_entry_index && deletion_index < search_index {
-                    self.move_entry(deletion_index, search_entry);
-                    self.repair_block_after_deletion(search_index);
+                    Self::move_entry(memory, table_data, deletion_index, search_entry);
+                    Self::repair_block_after_deletion(memory, table_data, search_index);
                     return
                 }
             } else if search_index < min_entry_index {
                 if deletion_index >= min_entry_index || deletion_index < search_index {
-                    self.move_entry(deletion_index, search_entry);
-                    self.repair_block_after_deletion(search_index);
+                    Self::move_entry(memory, table_data, deletion_index, search_entry);
+                    Self::repair_block_after_deletion(memory, table_data, search_index);
                     return
                 }
             } else {
@@ -400,25 +450,34 @@ impl<'m, S: Storage + 'm, C: HashTableConfig> HashTable<'m, S, C> {
     }
 
     // Moves src_entry to target_entry_index, clearing src_entry
-    fn move_entry(&mut self, target_entry_index: u32, src_entry: Entry<C, S>) {
-        assert!(src_entry.addr < self.data.addr + HEADER_SIZE + Self::ENTRY_SIZE * (self.capacity() * 2));
-        let target_entry = Self::get_entry_raw(self.memory, self.data, target_entry_index);
+    fn move_entry(memory: &mut Memory<S>, table_data: Allocation, target_entry_index: u32, src_entry: Entry<C, S>) {
+        Self::assert_is_valid_entry_for_table(memory, table_data, &src_entry);
+        let target_entry = Self::get_entry(memory, table_data, target_entry_index);
         debug_assert!(target_entry.is_empty());
         debug_assert!(!src_entry.is_empty());
-        self.memory.copy_nonoverlapping(src_entry.addr, target_entry.addr, Self::ENTRY_SIZE);
-        fill_zero(self.memory.get_bytes_mut(src_entry.addr, Self::ENTRY_SIZE));
+        memory.copy_nonoverlapping(src_entry.addr, target_entry.addr, C::ENTRY_SIZE);
+        fill_zero(memory.get_bytes_mut(src_entry.addr, C::ENTRY_SIZE));
     }
 
-    fn resize(&mut self, new_capacity: Size) {
-        let new_table_data = Self::alloc_with_capacity(self.memory, new_capacity);
-        let new_table_size = Self::entry_array_len_raw(self.memory, new_table_data);
-        assert_eq!(new_table_size, new_capacity.as_u32() * 2);
-        let len = self.len();
+    fn assert_is_valid_entry_for_table(memory: &Memory<S>, table_data: Allocation, entry: &Entry<C, S>) {
+        let entry_array_start = table_data.addr + HEADER_SIZE;
+        let last_valid_entry_addr = entry_array_start + C::ENTRY_SIZE * (Self::entry_array_len(memory, table_data) - 1);
+        debug_assert!(entry.addr >= entry_array_start && entry.addr <= last_valid_entry_addr);
+        debug_assert!((entry.addr.as_u32() - entry_array_start.as_u32()) % C::ENTRY_SIZE.as_u32() == 0,
+            "misaligned entry addr");
+    }
+
+    fn resize(memory: &mut Memory<S>, table_data: &mut Allocation, new_capacity: Size) {
+        let new_table_data = Self::alloc_with_capacity(memory, new_capacity);
+        let new_table_size = Self::entry_array_len(memory, new_table_data);
+        debug_assert!(new_table_size > 0);
+        assert_eq!(new_table_size, Self::entry_array_len_for_capacity(new_capacity));
+        let len = Self::len(memory, *table_data);
 
         let mut written = 0;
 
-        'outer: for read_index in 0 .. Self::entry_array_len_raw(self.memory, self.data) {
-            let read_entry = Self::get_entry_raw(self.memory, self.data, read_index);
+        'outer: for read_index in 0 .. Self::entry_array_len(memory, *table_data) {
+            let read_entry = Self::get_entry(memory, *table_data, read_index);
 
             if read_entry.is_empty() {
                 // Empty entry, nothing to copy
@@ -428,17 +487,17 @@ impl<'m, S: Storage + 'm, C: HashTableConfig> HashTable<'m, S, C> {
             let mut insertion_index = index_in_table(read_entry.hash(), new_table_size);
 
             for _ in 0 .. new_table_size {
-                let new_entry = Self::get_entry_raw(self.memory, new_table_data, insertion_index);
+                let new_entry = Self::get_entry(memory, new_table_data, insertion_index);
 
                 if new_entry.is_empty() {
-                    self.memory.copy_nonoverlapping(read_entry.addr, new_entry.addr, Self::ENTRY_SIZE);
+                    memory.copy_nonoverlapping(read_entry.addr, new_entry.addr, C::ENTRY_SIZE);
 
                     // TODO: do some assertions
 
                     written += 1;
-                    debug_assert!(written <= len,
+                    debug_assert!(written <= len.as_usize(),
                         "more non-null entries than len() in table. \
-                         written = {}, len={}", written, len);
+                         written = {}, len={}", written, len.as_usize());
                     continue 'outer
                 }
 
@@ -447,32 +506,32 @@ impl<'m, S: Storage + 'm, C: HashTableConfig> HashTable<'m, S, C> {
 
             panic!("no free entry found? len={}, old_capacity={}, \
                     old_table_size={}, new_capacity={}, new_table_size={}",
-                self.len(),
-                self.capacity(),
-                Self::entry_array_len_raw(self.memory, self.data),
+                len.as_usize(),
+                Self::capacity(memory, *table_data).as_usize(),
+                Self::entry_array_len(memory, *table_data),
                 new_capacity.0,
                 new_table_size);
         }
 
-        debug_assert_eq!(written, len);
-        Self::set_len_raw(self.memory, new_table_data, Size::from_usize(len));
+        debug_assert_eq!(written, len.as_usize());
+        Self::set_len(memory, new_table_data, len);
 
-        self.memory.free(self.data);
-        self.data = new_table_data;
+        memory.free(*table_data);
+        *table_data = new_table_data;
     }
 
-    fn sanity_check_entry(&self, entry_index: u32) {
-        let entry = Self::get_entry_raw(self.memory, self.data, entry_index);
+    fn sanity_check_entry(memory: &Memory<S>, table_data: Allocation, entry_index: u32) {
+        let entry = Self::get_entry(memory, table_data, entry_index);
         if entry.is_empty() {
             return
         }
 
-        let table_size = Self::entry_array_len_raw(self.memory, self.data);
+        let table_size = Self::entry_array_len(memory, table_data);
         let min_entry_index = index_in_table(entry.hash(), table_size);
 
         let mut i = entry_index;
         while i != min_entry_index {
-            assert!(!Self::get_entry_raw(self.memory, self.data, i).is_empty(),
+            assert!(!Self::get_entry(memory, table_data, i).is_empty(),
             "table_size = {}, index = {}, min_entry_index={}, i={}",
             table_size,
             entry_index,
@@ -487,74 +546,75 @@ impl<'m, S: Storage + 'm, C: HashTableConfig> HashTable<'m, S, C> {
         }
     }
 
-    pub fn sanity_check_table(&self) {
-        for index in 0 .. Self::entry_array_len_raw(self.memory, self.data) {
-            self.sanity_check_entry(index);
+    fn sanity_check_table(memory: &Memory<S>, table_data: Allocation) {
+        for index in 0 .. Self::entry_array_len(memory, table_data) {
+            Self::sanity_check_entry(memory, table_data, index);
         }
     }
 
-    pub fn iter<F: FnMut(&[u8], &[u8])>(&self, mut f: F) {
-        let table_size = Self::entry_array_len_raw(self.memory, self.data);
+    fn iter<F: FnMut(&[u8], &[u8])>(memory: &Memory<S>, table_data: Allocation, mut f: F) {
+        let table_size = Self::entry_array_len(memory, table_data);
         for index in 0 .. table_size {
-            let entry = Self::get_entry_raw(self.memory, self.data, index);
+            let entry = Self::get_entry(memory, table_data, index);
 
             if !entry.is_empty() {
-                f(entry.entry_data::<DataKindKey>(self.memory),
-                  entry.entry_data::<DataKindValue>(self.memory));
+                f(entry.entry_data::<DataKindKey>(memory),
+                  entry.entry_data::<DataKindValue>(memory));
             }
         }
     }
 
     #[inline]
-    fn get_entry_raw(storage: &Memory<S>, table_data: Allocation, entry_index: u32) -> Entry<C, S> {
-        let entry_addr = Self::entry_addr_raw(table_data, entry_index);
+    fn get_entry(memory: &Memory<S>, table_data: Allocation, entry_index: u32) -> Entry<C, S> {
+        debug_assert!(entry_index < Self::entry_array_len(memory, table_data));
+        let entry_addr = Self::entry_addr(table_data, entry_index);
         Entry {
-            metadata: u64::read_at(storage, entry_addr),
+            metadata: u64::read_at(memory, entry_addr),
             addr: entry_addr,
-            config: ::std::marker::PhantomData,
-            storage: ::std::marker::PhantomData,
+            config: PhantomData,
+            storage: PhantomData,
         }
     }
 
     #[inline]
-    fn set_len_raw(storage: &mut Memory<S>, table_data: Allocation, len: Size) {
+    fn set_len(storage: &mut Memory<S>, table_data: Allocation, len: Size) {
         len.write_at(storage, table_data.addr + LEN_OFFSET);
     }
 
     #[inline]
-    fn set_capacity_raw(storage: &mut Memory<S>, table_data: Allocation, capacity: Size) {
+    fn set_capacity(storage: &mut Memory<S>, table_data: Allocation, capacity: Size) {
         capacity.write_at(storage, table_data.addr + CAPACITY_OFFSET);
     }
 
     #[inline]
-    fn len_raw(storage: &Memory<S>, table_data: Allocation) -> Size {
+    fn len(storage: &Memory<S>, table_data: Allocation) -> Size {
         Size::read_at(storage, table_data.addr + LEN_OFFSET)
     }
 
     #[inline]
-    fn capacity_raw(storage: &Memory<S>, table_data: Allocation) -> Size {
+    fn capacity(storage: &Memory<S>, table_data: Allocation) -> Size {
         Size::read_at(storage, table_data.addr + CAPACITY_OFFSET)
     }
 
     #[inline]
-    fn entry_array_len_raw(storage: &Memory<S>, table_data: Allocation) -> u32 {
-        let capacity = Self::capacity_raw(storage, table_data);
+    fn entry_array_len(storage: &Memory<S>, table_data: Allocation) -> u32 {
+        let capacity = Self::capacity(storage, table_data);
         Self::entry_array_len_for_capacity(capacity)
     }
 
     #[inline]
-    fn entry_addr_raw(table_data: Allocation, entry_index: u32) -> Address {
-        table_data.addr + HEADER_SIZE + Self::ENTRY_SIZE * entry_index
+    fn entry_addr(table_data: Allocation, entry_index: u32) -> Address {
+        table_data.addr + HEADER_SIZE + C::ENTRY_SIZE * entry_index
     }
 
     #[inline]
     fn byte_count_for_capacity(capacity: Size) -> Size {
-        HEADER_SIZE + Self::ENTRY_SIZE * Self::entry_array_len_for_capacity(capacity)
+        HEADER_SIZE + C::ENTRY_SIZE * Self::entry_array_len_for_capacity(capacity)
     }
 
     #[inline]
     fn entry_array_len_for_capacity(capacity: Size) -> u32 {
-        capacity.as_u32() * 2u32
+        (capacity.as_u32() * 3) / 2
     }
 }
 

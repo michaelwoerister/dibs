@@ -1,6 +1,6 @@
 
 use allocator::{Allocator, Allocation};
-use std::ops::{Add, AddAssign, Sub, Mul};
+use std::ops::{Add, AddAssign, Sub, Mul, Div};
 use persist::{Serialize, Deserialize, StorageWriter, StorageReader};
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
@@ -213,6 +213,15 @@ impl Mul<u32> for Size {
     #[inline]
     fn mul(self, rhs: u32) -> Self::Output {
         Size(self.0 * rhs)
+    }
+}
+
+impl Div<u32> for Size {
+    type Output = Size;
+
+    #[inline]
+    fn div(self, rhs: u32) -> Self::Output {
+        Size(self.0 / rhs)
     }
 }
 
