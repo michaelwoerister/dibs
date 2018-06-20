@@ -26,7 +26,9 @@ pub fn read_header<S: Storage>(storage: &S) -> Result<Header, String> {
         return Err("File too small".to_string());
     }
 
-    let header_bytes = storage.get_bytes(Address(0), Size::from_usize(mem::size_of::<Header>()));
+    let header_bytes = unsafe {
+        storage.get_bytes(Address(0), Size::from_usize(mem::size_of::<Header>()))
+    };
 
     if &header_bytes[0 .. 4] != FILE_MAGIC {
         return Err(format!("File magic does not match."));
@@ -63,7 +65,7 @@ pub fn read_header<S: Storage>(storage: &S) -> Result<Header, String> {
     Ok(header)
 }
 
-pub fn write_header<S: Storage>(storage: &mut S,
+pub fn write_header<S: Storage>(storage: &S,
                                 supports_gc: bool,
                                 footer_addr: Address) {
     let mut flags = Flags::empty();
@@ -72,7 +74,9 @@ pub fn write_header<S: Storage>(storage: &mut S,
         flags |= Flags::SUPPORTS_GC;
     }
 
-    let header_bytes = storage.get_bytes_mut(Address(0), Size::from_usize(mem::size_of::<Header>()));
+    let header_bytes = unsafe {
+        storage.get_bytes_mut(Address(0), Size::from_usize(mem::size_of::<Header>()))
+    };
 
     header_bytes[0..4].copy_from_slice(&FILE_MAGIC);
     LittleEndian::write_u32(&mut header_bytes[ 4 ..  8], FILE_FORMAT_VERSION);

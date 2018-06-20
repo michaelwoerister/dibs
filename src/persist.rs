@@ -3,14 +3,14 @@ use byteorder::{ByteOrder, LittleEndian};
 use memory::*;
 
 pub struct StorageWriter<'s, S: Storage + 's> {
-    storage: &'s mut S,
+    storage: &'s Memory<S>,
     addr: Address,
 }
 
 impl<'s, S: Storage + 's> StorageWriter<'s, S> {
 
     #[inline]
-    pub fn new(storage: &'s mut S, addr: Address) -> Self {
+    pub fn new(storage: &'s Memory<S>, addr: Address) -> Self {
         StorageWriter {
             storage,
             addr,
@@ -19,19 +19,14 @@ impl<'s, S: Storage + 's> StorageWriter<'s, S> {
 
     #[inline]
     pub fn write_u32(&mut self, val: u32) {
-        LittleEndian::write_u32(self.storage.get_bytes_mut(self.addr, Size(4)), val);
+        LittleEndian::write_u32(&mut self.storage.get_bytes_mut(self.addr, Size(4)), val);
         self.addr += Size(4);
     }
 
     #[inline]
     pub fn write_u64(&mut self, val: u64) {
-        LittleEndian::write_u64(self.storage.get_bytes_mut(self.addr, Size(8)), val);
+        LittleEndian::write_u64(&mut self.storage.get_bytes_mut(self.addr, Size(8)), val);
         self.addr += Size(8);
-    }
-
-    #[inline]
-    pub fn current_addr(&self) -> Address {
-        self.addr
     }
 }
 
@@ -39,7 +34,7 @@ pub trait Serialize {
     fn write<'s, S: Storage + 's>(&self, writer: &mut StorageWriter<'s, S>);
 
     #[inline]
-    fn write_at<S: Storage>(&self, storage: &mut S, addr: Address) {
+    fn write_at<S: Storage>(&self, storage: &Memory<S>, addr: Address) {
         self.write(&mut StorageWriter::new(storage, addr));
     }
 }
@@ -56,14 +51,14 @@ impl<T: Serialize> Serialize for Vec<T> {
 }
 
 pub struct StorageReader<'s, S: Storage + 's> {
-    storage: &'s S,
+    storage: &'s Memory<S>,
     addr: Address,
 }
 
 impl<'s, S: Storage + 's> StorageReader<'s, S> {
 
     #[inline]
-    pub fn new(storage: &'s S, addr: Address) -> StorageReader<'s, S> {
+    pub fn new(storage: &'s Memory<S>, addr: Address) -> StorageReader<'s, S> {
         StorageReader {
             storage,
             addr,
@@ -72,14 +67,14 @@ impl<'s, S: Storage + 's> StorageReader<'s, S> {
 
     #[inline]
     pub fn read_u32(&mut self) -> u32 {
-        let val = LittleEndian::read_u32(self.storage.get_bytes(self.addr, Size(4)));
+        let val = LittleEndian::read_u32(&self.storage.get_bytes(self.addr, Size(4)));
         self.addr += Size(4);
         val
     }
 
     #[inline]
     pub fn read_u64(&mut self) -> u64 {
-        let val = LittleEndian::read_u64(self.storage.get_bytes(self.addr, Size(8)));
+        let val = LittleEndian::read_u64(&self.storage.get_bytes(self.addr, Size(8)));
         self.addr += Size(8);
         val
     }
@@ -89,7 +84,7 @@ pub trait Deserialize: Sized {
     fn read<'s, S: Storage + 's>(reader: &mut StorageReader<'s, S>) -> Self;
 
     #[inline]
-    fn read_at<S: Storage>(storage: &S, addr: Address) -> Self {
+    fn read_at<S: Storage>(storage: &Memory<S>, addr: Address) -> Self {
         Self::read(&mut StorageReader::new(storage, addr))
     }
 }

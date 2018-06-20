@@ -47,8 +47,10 @@ pub struct Allocator {
     free_by_addr: Vec<Allocation>,
     free_by_size: Vec<Allocation>,
     total_size: Size,
-}
 
+    // TODO: this could be optimized by using an interval tree
+    live_mem_refs: Vec<LiveMemRef>,
+}
 
 impl Allocator {
 
@@ -58,6 +60,7 @@ impl Allocator {
             free_by_addr: vec![Allocation::new(Address(0), total_size)],
             free_by_size: vec![Allocation::new(Address(0), total_size)],
             total_size,
+            live_mem_refs: vec![],
         }
     }
 
@@ -273,6 +276,44 @@ impl Allocator {
             assert!(self.free_by_addr[index + 1].addr > self.free_by_addr[index].addr)
         }
     }
+
+    pub(crate) fn register_mem_ref(&mut self, addr: Address, len: Size, mutable: bool) -> LiveMemRef {
+        let new_mem_ref = LiveMemRef::new(addr, len, mutable);
+
+        // Find allocation
+        let alloc_index = match self.find_alloc_by_address(addr) {
+            Ok(index) => index,
+            Err(index) => {
+                assert!(index > 0);
+                index - 1
+            }
+        };
+
+        // Check that we have an allocation
+        assert!(alloc_index < self.allocations.len());
+
+        // Check that the borrowed range does not extend beyond the allocation
+        assert!(new_mem_ref.end <= self.allocations[alloc_index].end());
+
+        // Check that we don't conflict with any other borrowed range
+        assert!(!self.live_mem_refs.iter().any(|lmr| lmr.conflicts_with(&new_mem_ref)));
+
+        self.live_mem_refs.push(new_mem_ref);
+
+        new_mem_ref
+    }
+
+    pub(crate) fn unregister_mem_ref(&mut self, mem_ref: LiveMemRef) {
+        let idx = self.live_mem_refs.iter().rposition(|&x| x == mem_ref).expect("wat?!");
+
+        let last_index = self.live_mem_refs.len() - 1;
+
+        if idx != last_index {
+            self.live_mem_refs[idx] = self.live_mem_refs[last_index];
+        }
+
+        self.live_mem_refs.pop();
+    }
 }
 
 impl Serialize for Allocator {
@@ -283,12 +324,41 @@ impl Serialize for Allocator {
             ref free_by_addr,
             ref free_by_size,
             total_size,
+            live_mem_refs: _,
         } = *self;
 
         allocations.write(writer);
         free_by_addr.write(writer);
         free_by_size.write(writer);
         total_size.write(writer);
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) struct LiveMemRef {
+    start: Address,
+    end: Address,
+    mutable: bool,
+}
+
+impl LiveMemRef {
+
+    fn new(start: Address, len: Size, mutable: bool) -> LiveMemRef {
+        LiveMemRef {
+            start,
+            end: start + len,
+            mutable,
+        }
+    }
+
+    fn conflicts_with(&self, other: &LiveMemRef) -> bool {
+        if !self.mutable && !other.mutable {
+            // two shared slices never conflict
+            return false
+        }
+
+        // Check for overlap
+        (self.end > other.start) && (other.end > self.start)
     }
 }
 

@@ -1,7 +1,11 @@
 
-use allocator::{Allocator, Allocation};
-use std::ops::{Add, AddAssign, Sub, Mul, Div};
+use std::mem;
+use std::slice;
+use std::cmp::Ordering;
+use allocator::{Allocator, Allocation, LiveMemRef};
+use std::ops::{Add, AddAssign, Sub, Mul, Div, Deref, DerefMut};
 use persist::{Serialize, Deserialize, StorageWriter, StorageReader};
+use parking_lot::Mutex;
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct Address(pub u32);
@@ -9,17 +13,100 @@ pub struct Address(pub u32);
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct Size(pub u32);
 
+#[derive(Clone)]
+pub struct MemRef<'m> {
+    slice: &'m [u8],
+
+    #[cfg(debug_assertions)]
+    allocator: &'m Mutex<Allocator>,
+    #[cfg(debug_assertions)]
+    mem_ref: LiveMemRef,
+}
+
+impl<'m1, 'm2> PartialEq<MemRef<'m1>> for MemRef<'m2> {
+    fn eq(&self, other: &MemRef<'m1>) -> bool {
+        self.slice == other.slice
+    }
+}
+
+impl<'m> Eq for MemRef<'m> {}
+
+impl<'m1, 'm2> PartialOrd<MemRef<'m1>> for MemRef<'m2> {
+    fn partial_cmp(&self, other: &MemRef<'m1>) -> Option<Ordering> {
+        (self.slice.as_ptr(), self.slice.len())
+            .partial_cmp(&(other.slice.as_ptr(), other.slice.len()))
+    }
+}
+
+
+impl<'m> Deref for MemRef<'m> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.slice
+    }
+}
+
+impl<'m> PartialEq<[u8]> for MemRef<'m> {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.slice == other
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<'m> Drop for MemRef<'m> {
+    fn drop(&mut self) {
+        self.allocator.lock().unregister_mem_ref(self.mem_ref);
+    }
+}
+
+pub struct MemRefMut<'a> {
+    slice: &'a mut [u8],
+
+    #[cfg(debug_assertions)]
+    allocator: &'a Mutex<Allocator>,
+    #[cfg(debug_assertions)]
+    mem_ref: LiveMemRef,
+}
+
+impl<'m, 'g> Deref for MemRefMut<'m> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.slice
+    }
+}
+
+impl<'m> DerefMut for MemRefMut<'m> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.slice
+    }
+}
+
+impl<'m> PartialEq<[u8]> for MemRefMut<'m> {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.slice == other
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<'m> Drop for MemRefMut<'m> {
+    fn drop(&mut self) {
+        self.allocator.lock().unregister_mem_ref(self.mem_ref);
+    }
+}
+
 pub trait Storage {
+    const IS_READONLY: bool;
     fn size(&self) -> Size;
-    fn write_bytes(&mut self, addr: Address, b: &[u8]);
-    fn get_bytes(&self, addr: Address, len: Size) -> &[u8];
-    fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8];
-    fn copy_nonoverlapping(&mut self, src: Address, dst: Address, len: Size);
+    unsafe fn get_bytes(&self, addr: Address, len: Size) -> &[u8];
+    unsafe fn get_bytes_mut(&self, addr: Address, len: Size) -> &mut [u8];
+    unsafe fn copy_nonoverlapping_exclusive(&mut self, src: Address, dst: Address, len: Size);
 }
 
 pub struct Memory<S: Storage> {
     pub(crate) storage: S,
-    pub(crate) allocator: Allocator,
+    pub(crate) allocator: Mutex<Allocator>,
 }
 
 impl<S: Storage> Memory<S> {
@@ -27,7 +114,7 @@ impl<S: Storage> Memory<S> {
     #[inline]
     pub fn new(storage: S) -> Memory<S> {
         Memory {
-            allocator: Allocator::new(storage.size()),
+            allocator: Mutex::new(Allocator::new(storage.size())),
             storage,
         }
     }
@@ -37,7 +124,7 @@ impl<S: Storage> Memory<S> {
         assert!(storage.size() >= allocator.total_size());
 
         Memory {
-            allocator,
+            allocator: Mutex::new(allocator),
             storage,
         }
     }
@@ -48,108 +135,165 @@ impl<S: Storage> Memory<S> {
     }
 
     #[inline]
-    pub fn write_bytes(&mut self, addr: Address, b: &[u8]) {
-        self.storage.write_bytes(addr, b);
+    pub fn get_bytes(&self, addr: Address, len: Size) -> MemRef {
+        #[cfg(debug_assertions)]
+        unsafe {
+            MemRef {
+                slice: self.storage.get_bytes(addr, len),
+                allocator: &self.allocator,
+                mem_ref: self.allocator.lock().register_mem_ref(addr, len, false),
+            }
+        }
+
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            MemRef {
+                slice: self.storage.get_bytes(addr, len),
+            }
+        }
     }
 
     #[inline]
-    pub fn get_bytes(&self, addr: Address, len: Size) -> &[u8] {
-        self.storage.get_bytes(addr, len)
+    pub fn get_bytes_mut(&self, addr: Address, len: Size) -> MemRefMut {
+        assert!(!S::IS_READONLY);
+
+        #[cfg(debug_assertions)]
+        unsafe {
+            MemRefMut {
+                slice: self.storage.get_bytes_mut(addr, len),
+                allocator: &self.allocator,
+                mem_ref: self.allocator.lock().register_mem_ref(addr, len, true),
+            }
+        }
+
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            MemRefMut {
+                slice: self.storage.get_bytes_mut(addr, len),
+            }
+        }
     }
 
     #[inline]
-    pub fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8] {
-        self.storage.get_bytes_mut(addr, len)
+    pub fn alloc(&self, size: Size) -> Allocation {
+        assert!(!S::IS_READONLY);
+
+        self.allocator.lock().alloc(size)
     }
 
     #[inline]
-    pub fn alloc(&mut self, size: Size) -> Allocation {
-        self.allocator.alloc(size)
+    pub fn free(&self, allocation: Allocation) {
+        assert!(!S::IS_READONLY);
+
+        unsafe {
+            fill_zero(&mut self.storage.get_bytes_mut(allocation.addr, allocation.size));
+        }
+        self.allocator.lock().free(allocation);
     }
 
     #[inline]
-    pub fn free(&mut self, allocation: Allocation) {
-        fill_zero(self.storage.get_bytes_mut(allocation.addr, allocation.size));
-        self.allocator.free(allocation);
+    pub fn copy_nonoverlapping(&self, src: Address, dst: Address, len: Size) {
+        assert!(!S::IS_READONLY);
+
+        let src_end = src + len;
+        let dst_end = dst + len;
+
+        assert!(src >= dst_end || dst >= src_end);
+
+        self.get_bytes_mut(dst, len).copy_from_slice(&self.get_bytes(src, len));
     }
 }
 
-impl<S: Storage> Storage for Memory<S> {
-    #[inline]
-    fn size(&self) -> Size {
-        self.storage.size()
-    }
+// impl<S: Storage> Storage for Memory<S> {
+//     #[inline]
+//     fn size(&self) -> Size {
+//         self.storage.size()
+//     }
 
-    #[inline]
-    fn write_bytes(&mut self, addr: Address, b: &[u8]) {
-        self.storage.write_bytes(addr, b);
-    }
+//     #[inline]
+//     fn get_bytes(&self, addr: Address, len: Size) -> MemRef {
+//         self.storage.get_bytes(addr, len)
+//     }
 
-    #[inline]
-    fn get_bytes(&self, addr: Address, len: Size) -> &[u8] {
-        self.storage.get_bytes(addr, len)
-    }
+//     fn get_bytes_mut(&self, addr: Address, len: Size) -> MemRefMut {
+//         self.storage.get_bytes_mut(addr, len)
+//     }
 
-    #[inline]
-    fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8] {
-        self.storage.get_bytes_mut(addr, len)
-    }
+//     #[inline]
+//     fn get_bytes_mut_exclusive(&mut self, addr: Address, len: Size) -> &mut [u8] {
+//         self.storage.get_bytes_mut_exclusive(addr, len)
+//     }
 
-    #[inline]
-    fn copy_nonoverlapping(&mut self, src: Address, dst: Address, len: Size) {
-        self.storage.copy_nonoverlapping(src, dst, len);
-    }
-}
+//     #[inline]
+//     fn copy_nonoverlapping_exclusive(&mut self, src: Address, dst: Address, len: Size) {
+//         self.storage.copy_nonoverlapping_exclusive(src, dst, len);
+//     }
+// }
 
 pub struct MemStore {
-    data: Vec<u8>,
+    data: *mut u8,
+    len: usize,
 }
 
 impl MemStore {
     pub fn new(size: usize) -> MemStore {
+        let mut vec = vec![0u8; size];
+
+        let data = vec.as_mut_ptr();
+        let len = vec.len();
+
+        mem::forget(vec);
+
         MemStore {
-            data: vec![0u8; size],
+            data,
+            len,
+        }
+    }
+
+    fn get_slice(&self, start: Address, len: Size) -> &[u8] {
+        assert!((start + len).as_usize() <= self.len);
+
+        unsafe {
+            slice::from_raw_parts(self.data.offset(start.as_isize()), len.as_usize())
+        }
+    }
+
+    fn get_slice_mut(&self, start: Address, len: Size) -> &mut [u8] {
+        assert!((start + len).as_usize() <= self.len);
+
+        unsafe {
+            slice::from_raw_parts_mut(self.data.offset(start.as_isize()), len.as_usize())
         }
     }
 }
 
+// TODO: drop
+
 impl Storage for MemStore {
+    const IS_READONLY: bool = false;
+
     #[inline]
     fn size(&self) -> Size {
-        Size::from_usize(self.data.len())
+        Size::from_usize(self.len)
     }
 
     #[inline]
-    fn write_bytes(&mut self, addr: Address, b: &[u8]) {
-        let start = addr.0 as usize;
-        let end = start + b.len();
+    unsafe fn get_bytes(&self, addr: Address, len: Size) -> &[u8] {
+        self.get_slice(addr, len)
+    }
 
-        self.data[start .. end].copy_from_slice(b);
+    unsafe fn get_bytes_mut(&self, addr: Address, len: Size) -> &mut [u8] {
+        self.get_slice_mut(addr, len)
     }
 
     #[inline]
-    fn get_bytes(&self, addr: Address, len: Size) -> &[u8] {
-        &self.data[addr.0 as usize .. (addr + len).0 as usize]
-    }
-
-    #[inline]
-    fn get_bytes_mut(&mut self, addr: Address, len: Size) -> &mut [u8] {
-        &mut self.data[addr.0 as usize .. (addr + len).0 as usize]
-    }
-
-    #[inline]
-    fn copy_nonoverlapping(&mut self, src: Address, dst: Address, len: Size) {
+    unsafe fn copy_nonoverlapping_exclusive(&mut self, src: Address, dst: Address, len: Size) {
         #[cfg(debug_assertions)]
         {
             // TODO assert non-overlapping
         }
 
-        // TODO: safe implementation
-        unsafe {
-            let src = self.data[src.as_usize()..].as_ptr();
-            let dst = self.data[dst.as_usize()..].as_mut_ptr();
-            ::std::ptr::copy_nonoverlapping(src, dst, len.as_usize());
-        }
+        self.get_slice_mut(dst, len).copy_from_slice(self.get_slice(src, len));
     }
 }
 
@@ -243,6 +387,11 @@ impl Address {
     #[inline]
     pub fn as_usize(self) -> usize {
         self.0 as usize
+    }
+
+    #[inline]
+    pub fn as_isize(self) -> isize {
+        self.0 as isize
     }
 
     #[inline]

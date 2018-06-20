@@ -7,10 +7,10 @@ use rand::{thread_rng, random, Rng};
 use std::collections::HashMap;
 
 fn main() {
-    let mut memory = create_memory();
+    let memory = create_memory();
 
     let mut reference = HashMap::new();
-    let mut table: HashTable<_, DefaultHashTableConfig> = HashTable::new(&mut memory);
+    let mut table: HashTable<_, DefaultHashTableConfig> = HashTable::new(&memory);
 
     let mut next_table_size_to_report = 100;
 
@@ -36,7 +36,7 @@ fn main() {
         table.sanity_check_table();
 
         for (key, value) in reference.iter() {
-            assert_eq!(table.find(&key[..]), Some(&value[..]));
+            assert_eq!(table.find(&key[..]).as_ref().map(|x| &**x), Some(&value[..]));
         }
 
         let mut data = HashMap::with_capacity(reference.len());
@@ -68,7 +68,7 @@ fn main() {
 }
 
 fn create_memory() -> Memory<MemStore> {
-    let mut memory = Memory::new(MemStore::new(100000000));
+    let memory = Memory::new(MemStore::new(100000000));
     // Make sure we reserve the Null address.
     memory.alloc(Size(10));
     memory
