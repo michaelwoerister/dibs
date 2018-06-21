@@ -233,6 +233,8 @@ impl<S: Storage> Memory<S> {
 pub struct MemStore {
     data: *mut u8,
     len: usize,
+    // used for dropping
+    capacity: usize,
 }
 
 impl MemStore {
@@ -241,12 +243,14 @@ impl MemStore {
 
         let data = vec.as_mut_ptr();
         let len = vec.len();
+        let capacity = vec.capacity();
 
         mem::forget(vec);
 
         MemStore {
             data,
             len,
+            capacity,
         }
     }
 
@@ -267,7 +271,14 @@ impl MemStore {
     }
 }
 
-// TODO: drop
+impl Drop for MemStore {
+    fn drop(&mut self) {
+        let drop_me = unsafe {
+            Vec::from_raw_parts(self.data, self.len, self.capacity)
+        };
+        mem::drop(drop_me);
+    }
+}
 
 impl Storage for MemStore {
     const IS_READONLY: bool = false;
