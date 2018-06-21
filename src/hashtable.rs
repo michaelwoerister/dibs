@@ -646,7 +646,7 @@ mod tests {
     use MemStore;
 
     fn create_memory(size: usize) -> Memory<MemStore> {
-        let mut memory = Memory::new(MemStore::new(size));
+        let memory = Memory::new(MemStore::new(size));
 
         memory.alloc(Size(1));
 

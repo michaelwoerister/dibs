@@ -172,6 +172,13 @@ impl<S: Storage> Database<S> {
 
 impl<S: Storage> Drop for Database<S> {
     fn drop(&mut self) {
+        if S::IS_READONLY {
+            return
+        }
+
+        // let record_table_addr = record::persist_record_table(&self.memory,
+        //                                                      self.records,
+        //                                                      self.record_id_free_list);
 
         // Find footer address
         let footer_addr = self.memory.allocator.lock().max_addr();

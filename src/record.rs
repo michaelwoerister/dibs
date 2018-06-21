@@ -99,6 +99,8 @@ const FIRST_FREE_OFFSET: Size = Size(8);
 const ARRAY_OFFSET: Size = Size(12);
 const RECORD_SIZE: Size = Size(mem::size_of::<Record>() as u32);
 
+const FREE_PTR_OFFSET_WITHIN_RECORD: Size = Size(4);
+
 impl<'s, S: Storage + 's> RecordTable<'s, S> {
 
     #[inline]
@@ -120,15 +122,12 @@ impl<'s, S: Storage + 's> RecordTable<'s, S> {
     }
 
     #[inline]
-    pub fn first_free(&self) -> RecordId {
-        RecordId::read_at(self.storage, self.data.addr + FIRST_FREE_OFFSET)
-    }
-
-    #[inline]
     pub fn get_record(&self, id: RecordId) -> Record {
         assert!(id.0 > 0 && id.0 < self.array_len().as_u32());
         let addr = self.data.addr + ARRAY_OFFSET + RECORD_SIZE * id.idx();
-        Record::read_at(self.storage, addr)
+        let record = Record::read_at(self.storage, addr);
+        assert!(record.addr != Address(0));
+        record
     }
 }
 
@@ -143,19 +142,21 @@ impl<'s, S: Storage + 's> RecordTableMut<'s, S> {
         }
     }
 
-    pub fn init_at(storage: &'s Memory<S>, addr: Address, records: &[Record]) -> RecordTableMut<'s, S> {
+    pub fn alloc(storage: &'s Memory<S>, records: &[Record]) -> RecordTableMut<'s, S> {
 
         let item_count = Size::from_usize(records.len());
         let array_len = item_count + Size(1);
-        let data_size = ARRAY_OFFSET + array_len * RECORD_SIZE;
+        let table_byte_size = ARRAY_OFFSET + array_len * RECORD_SIZE;
 
-        item_count.write_at(storage, addr + ITEM_COUNT_OFFSET);
-        array_len.write_at(storage, addr + ARRAY_LEN_OFFSET);
-        RecordId(0).write_at(storage, addr + FIRST_FREE_OFFSET);
+        let alloc = storage.alloc(table_byte_size);
+
+        item_count.write_at(storage, alloc.addr + ITEM_COUNT_OFFSET);
+        array_len.write_at(storage, alloc.addr + ARRAY_LEN_OFFSET);
+        RecordId(0).write_at(storage, alloc.addr + FIRST_FREE_OFFSET);
 
         let mut table = RecordTableMut {
             storage,
-            data: Allocation::new(addr, data_size),
+            data: alloc,
         };
 
         for (index, &record) in records.iter().enumerate() {
@@ -189,8 +190,97 @@ impl<'s, S: Storage + 's> RecordTableMut<'s, S> {
     #[inline]
     pub fn set_record(&mut self, id: RecordId, record: Record) {
         assert!(id.0 > 0 && id.0 < self.array_len().as_u32());
+        assert!(record.addr != Address(0));
         let addr = self.data.addr + ARRAY_OFFSET + RECORD_SIZE * id.idx();
         record.write_at(self.storage, addr);
+    }
+
+    #[inline]
+    pub fn alloc_record(&mut self, record: Record) -> RecordId {
+        assert!(record.addr != Address(0));
+
+        // Expand size if necessary
+        if self.first_free() == RecordId(0) {
+            let item_count = self.item_count();
+            let old_array_len = self.array_len();
+            debug_assert_eq!(old_array_len, item_count + Size(1));
+            let new_max_item_count = if item_count == Size(0) {
+                Size(8)
+            } else {
+                item_count * 2u32
+            };
+            let new_alloc = self.storage.alloc(record_table_alloc_size_for(new_max_item_count.as_usize()));
+            self.storage.copy_nonoverlapping(self.data.addr, new_alloc.addr, self.data.size);
+            fill_zero(&mut self.storage.get_bytes_mut(new_alloc.addr + self.data.size, new_alloc.size - self.data.size));
+            let new_array_len = new_max_item_count + Size(1u32);
+            new_array_len.write_at(self.storage, new_alloc.addr + ARRAY_LEN_OFFSET);
+
+            let mut free_ptr = new_alloc.addr + FIRST_FREE_OFFSET;
+            println!("&first_free = {:?}, array_len_before={:?}", free_ptr, old_array_len);
+            for free_record in old_array_len.as_u32() .. new_array_len.as_u32() {
+                let record_id = RecordId(free_record);
+                record_id.write_at(self.storage, free_ptr);
+                free_ptr = new_alloc.addr + ARRAY_OFFSET + RECORD_SIZE * free_record + FREE_PTR_OFFSET_WITHIN_RECORD;
+                println!("record_id = {:?}, free_ptr = {:?}", record_id, free_ptr);
+            }
+
+            self.storage.free(self.data);
+            self.data = new_alloc;
+
+            #[cfg(debug_assertions)]
+            {
+                assert_eq!(self.item_count(), item_count);
+
+                let all_free = self.all_free();
+                let expected: Vec<_> = (old_array_len.as_u32() .. new_array_len.as_u32())
+                    .map(|i| RecordId(i))
+                    .collect();
+                assert_eq!(all_free, expected);
+            }
+        }
+
+        let new_id = {
+            assert!(self.first_free() != RecordId(0));
+
+            let free_id = self.first_free();
+
+            let record_addr = self.record_addr(free_id);
+            assert!(Address::read_at(self.storage, record_addr) == Address(0));
+            let next_free = RecordId::read_at(self.storage, record_addr + FREE_PTR_OFFSET_WITHIN_RECORD);
+            next_free.write_at(self.storage, self.data.addr + FIRST_FREE_OFFSET);
+
+            free_id
+        };
+
+        self.set_record(new_id, record);
+        (self.item_count() + Size(1)).write_at(self.storage, self.data.addr + ITEM_COUNT_OFFSET);
+
+        new_id
+    }
+
+    pub fn delete_record(&mut self, record_id: RecordId) {
+        #[cfg(debug_assertions)]
+        {
+            self.iter_free(|id| assert!(record_id != id));
+        }
+
+        let record_addr = self.record_addr(record_id);
+        assert!(Address::read_at(self.storage, record_addr) != Address(0));
+
+        fill_zero(&mut self.storage.get_bytes_mut(record_addr, RECORD_SIZE));
+
+        self.first_free().write_at(self.storage, record_addr + FREE_PTR_OFFSET_WITHIN_RECORD);
+        record_id.write_at(self.storage, self.data.addr + FIRST_FREE_OFFSET);
+        (self.item_count() - Size(1)).write_at(self.storage, self.data.addr + ITEM_COUNT_OFFSET);
+
+        assert!(Address::read_at(self.storage, record_addr) == Address(0));
+
+        #[cfg(debug_assertions)]
+        {
+            let mut found = false;
+            self.iter_free(|id| found = found || (id == record_id));
+            assert!(found);
+        }
     }
 
     #[inline]
@@ -200,6 +290,57 @@ impl<'s, S: Storage + 's> RecordTableMut<'s, S> {
             data: self.data,
         }
     }
+
+    #[inline]
+    fn record_addr(&self, id: RecordId) -> Address {
+        assert!(id.0 > 0 && id.0 < self.array_len().as_u32(),
+            "id={:?}, array_len={:?}", id, self.array_len());
+        self.data.addr + ARRAY_OFFSET + RECORD_SIZE * id.idx()
+    }
+
+    fn all_free(&self) -> Vec<RecordId> {
+        let mut result = vec![];
+
+        self.iter_free(|id| result.push(id));
+
+        result.sort();
+
+        result
+    }
+
+    fn iter_free<F: FnMut(RecordId)>(&self, mut f: F) {
+        let mut free_ptr = self.first_free();
+
+        while free_ptr != RecordId(0) {
+            f(free_ptr);
+            free_ptr = RecordId::read_at(self.storage, self.record_addr(free_ptr ) + FREE_PTR_OFFSET_WITHIN_RECORD);
+        }
+    }
+}
+
+fn record_table_alloc_size_for(record_count: usize) -> Size {
+    ARRAY_OFFSET + RECORD_SIZE * (record_count + 1)
+}
+
+
+pub(crate) fn persist_record_table<S: Storage>(memory: &Memory<S>,
+                                               records: Vec<Record>,
+                                               record_id_free_list: Vec<RecordId>)
+                                               -> Address {
+//     let alloc = memory.alloc(record_table_alloc_size_for(records.len()));
+
+//     let mut writer = StorageWriter::new(storage, alloc.addr);
+
+//     Size::from_usize(records.len() - record_id_free_list.len()).write(&mut writer);
+//     Size::from_usize(records.len()).write(&mut writer);
+//     Size::from_usize(records.len()).write(&mut writer);
+
+// //     const ITEM_COUNT_OFFSET: Size = Size(0);
+// // const ARRAY_LEN_OFFSET: Size = Size(4);
+// // const FIRST_FREE_OFFSET: Size = Size(8);
+// // const ARRAY_OFFSET: Size = Size(12);
+
+    panic!()
 }
 
 #[cfg(test)]
@@ -208,42 +349,107 @@ mod tests {
 
     fn create_storage(record_count: usize) -> Memory<MemStore> {
         let size = ARRAY_OFFSET + RECORD_SIZE * (record_count + 1) + Size(1);
-        Memory::new(MemStore::new(size.as_usize()))
+        let memory = Memory::new(MemStore::new(size.as_usize()));
+        memory.alloc(Size(1));
+        memory
     }
 
-    // #[test]
-    // fn test_init_at() {
+    #[test]
+    fn test_alloc_table() {
 
-    //     let records = [
-    //         Record {
-    //             addr: Address(1010),
-    //             size: Size(2323),
-    //             ref_count: 3432,
-    //         },
-    //         Record {
-    //             addr: Address(76),
-    //             size: Size(34324),
-    //             ref_count: 23,
-    //         },
-    //         Record {
-    //             addr: Address(743),
-    //             size: Size(23),
-    //             ref_count: 8,
-    //         },
-    //     ];
+        let records = [
+            Record {
+                addr: Address(1010),
+                size: Size(2323),
+                ref_count: 3432,
+            },
+            Record {
+                addr: Address(76),
+                size: Size(34324),
+                ref_count: 23,
+            },
+            Record {
+                addr: Address(743),
+                size: Size(23),
+                ref_count: 8,
+            },
+        ];
 
-    //     let mut storage = create_storage(records.len());
+        let storage = create_storage(records.len());
 
-    //     let record_table = RecordTableMut::init_at(&mut storage, Address(1), &records[..]);
+        let record_table = RecordTableMut::alloc(&storage, &records[..]);
 
-    //     assert_eq!(record_table.item_count(), Size(3));
-    //     assert_eq!(record_table.array_len(),  Size(4));
-    //     assert_eq!(record_table.first_free(), RecordId(0));
+        assert_eq!(record_table.item_count(), Size(3));
+        assert_eq!(record_table.array_len(),  Size(4));
+        assert_eq!(record_table.first_free(), RecordId(0));
 
-    //     for i in 0 .. records.len() {
-    //         let record_id = RecordId((i + 1) as u32);
+        for i in 0 .. records.len() {
+            let record_id = RecordId((i + 1) as u32);
 
-    //         assert_eq!(records[i], record_table.get_record(record_id));
-    //     }
-    // }
+            assert_eq!(records[i], record_table.get_record(record_id));
+        }
+    }
+
+    #[test]
+    fn test_alloc_record() {
+
+        let storage = create_storage(500);
+
+        let mut record_table = RecordTableMut::alloc(&storage, &[]);
+
+        assert_eq!(record_table.item_count(), Size(0));
+        assert_eq!(record_table.array_len(),  Size(1));
+        assert_eq!(record_table.first_free(), RecordId(0));
+
+        let mut records = vec![];
+
+        for i in 0 .. 100 {
+            let record = Record {
+                addr: Address(i * 7 + 1),
+                size: Size(i * 3),
+                ref_count: i * 11,
+            };
+
+            let id = record_table.alloc_record(record);
+
+            records.push((id, record));
+        }
+
+        for (id, record) in records {
+            assert_eq!(record_table.get_record(id), record);
+        }
+    }
+
+    #[test]
+    fn test_delete_record() {
+
+        let storage = create_storage(300);
+
+        let mut record_table = RecordTableMut::alloc(&storage, &[]);
+
+        let mut records = vec![];
+
+        for i in 0 .. 100 {
+            let record = Record {
+                addr: Address(i * 7 + 1),
+                size: Size(i * 3),
+                ref_count: i * 11,
+            };
+
+            let id = record_table.alloc_record(record);
+
+            records.push(id);
+        }
+
+        let mut free_records = record_table.all_free();
+
+        for id in records {
+            record_table.delete_record(id);
+
+            free_records.push(id);
+            free_records.sort();
+
+            assert_eq!(free_records, record_table.all_free());
+        }
+    }
 }

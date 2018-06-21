@@ -86,7 +86,13 @@ impl Allocator {
             Err(index) => {
                 // Next best fit.
                 if index == self.free_by_size.len() {
-                    println!("{:?}, size={:?}", self.free_by_size, size);
+                    let max_available_size = self.free_by_size
+                        .last()
+                        .map(|alloc| alloc.size.as_u32())
+                        .unwrap_or(0);
+
+                    panic!("Could not allocate memory of size {}. Max available size is {}",
+                        size.as_u32(), max_available_size);
                 }
 
                 let available_alloc = self.free_by_size[index];
