@@ -25,7 +25,7 @@ pub use allocator::{Allocator, Allocation};
 pub use buffer::{Buffer, BufferProvider};
 pub use hashtable::{HashTable, HashTableConfig, DefaultHashTableConfig};
 pub use memory::*;
-use record::{Record, RecordId};
+use record::{Record, RecordId, RuntimeRecordTable, RecordTableMut};
 
 pub struct Encoder<'buf, 'db, S: Storage + 'db> {
     db: &'db mut Database<S>,
@@ -75,6 +75,13 @@ impl<'buf, 'db, S: Storage + 'db> Encoder<'buf, 'db, S> {
             let record = &mut db.records[record_id.idx()];
             record.addr = allocation.addr;
             record.size = allocation.size;
+            // db.record_table.with_mut(&db.memory, |record_table| {
+            //     record_table.set_record(record_id, Record {
+            //         addr: allocation.addr,
+            //         size: allocation.size,
+            //         ref_count
+            //     })
+            // });
         }
 
         record_id
@@ -104,8 +111,7 @@ impl CurrentRecordId {
 
 pub struct Database<S: Storage> {
     memory: Memory<S>,
-    record_id_free_list: Vec<RecordId>,
-    records: Vec<Record>,
+    record_table: RuntimeRecordTable<S>,
     buffer_providers: Vec<BufferProvider>,
 }
 
@@ -114,26 +120,25 @@ impl<S: Storage> Database<S> {
     pub fn init(mut memory: Memory<S>) -> Database<S> {
         header::reserve_header(&mut memory);
 
+        let record_table = RuntimeRecordTable::from(RecordTableMut::alloc(&memory, &[]));
+
         Database {
             memory,
-            record_id_free_list: Vec::new(),
-            records: Vec::new(),
+            record_table,
             buffer_providers: Vec::new(),
         }
     }
 
     fn alloc_record(&mut self) -> RecordId {
-        if let Some(record_id) = self.record_id_free_list.pop() {
-            assert_eq!(self.records[record_id.idx()], Record::null());
-            record_id
-        } else {
-            self.records.push(Record::null());
-            RecordId::from_usize(self.records.len())
-        }
+        self.record_table.with_mut(&self.memory, |record_table| {
+            record_table.alloc_record()
+        })
     }
 
     pub fn get_record(&self, record_id: RecordId) -> MemRef {
-        let record = &self.records[record_id.idx()];
+        let record = self.record_table.with(&self.memory, |record_table| {
+            record_table.get_record(record_id)
+        });
         self.memory.get_bytes(record.addr, record.size)
     }
 
@@ -159,10 +164,12 @@ impl<S: Storage> Database<S> {
     }
 
     pub fn delete_record(&mut self, record_id: RecordId) {
-        let record = self.records[record_id.idx()];
+        // let record = self.records[record_id.idx()];
+        let record = self.record_table.with_mut(&self.memory, |record_table| {
+            record_table.delete_record(record_id)
+        });
+
         self.memory.free(Allocation::new(record.addr, record.size));
-        self.records[record_id.idx()] = Record::null();
-        self.record_id_free_list.push(record_id);
     }
 
     pub fn persist(self) {

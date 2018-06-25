@@ -53,6 +53,9 @@ impl Record {
     }
 }
 
+const EMPTY_RECORD_ADDRESS: Address = Address(0);
+const PENDING_RECORD_ADDRESS: Address = Address(0);
+
 impl Serialize for Record {
     #[inline]
     fn write<'s, S: Storage + 's>(&self, writer: &mut StorageWriter<'s, S>) {
@@ -82,6 +85,7 @@ impl Deserialize for Record {
         }
     }
 }
+
 
 pub(crate) struct RecordTable<'s, S: Storage + 's> {
     storage: &'s Memory<S>,
@@ -126,7 +130,8 @@ impl<'s, S: Storage + 's> RecordTable<'s, S> {
         assert!(id.0 > 0 && id.0 < self.array_len().as_u32());
         let addr = self.data.addr + ARRAY_OFFSET + RECORD_SIZE * id.idx();
         let record = Record::read_at(self.storage, addr);
-        assert!(record.addr != Address(0));
+        assert!(record.addr != EMPTY_RECORD_ADDRESS);
+        assert!(record.addr != PENDING_RECORD_ADDRESS);
         record
     }
 }
@@ -190,15 +195,13 @@ impl<'s, S: Storage + 's> RecordTableMut<'s, S> {
     #[inline]
     pub fn set_record(&mut self, id: RecordId, record: Record) {
         assert!(id.0 > 0 && id.0 < self.array_len().as_u32());
-        assert!(record.addr != Address(0));
         let addr = self.data.addr + ARRAY_OFFSET + RECORD_SIZE * id.idx();
+        assert_ne!(Address::read_at(self.storage, addr), EMPTY_RECORD_ADDRESS);
         record.write_at(self.storage, addr);
     }
 
     #[inline]
-    pub fn alloc_record(&mut self, record: Record) -> RecordId {
-        assert!(record.addr != Address(0));
-
+    pub fn alloc_record(&mut self) -> RecordId {
         // Expand size if necessary
         if self.first_free() == RecordId(0) {
             let item_count = self.item_count();
@@ -252,20 +255,23 @@ impl<'s, S: Storage + 's> RecordTableMut<'s, S> {
             free_id
         };
 
-        self.set_record(new_id, record);
+        PENDING_RECORD_ADDRESS.write_at(self.storage, self.record_addr(new_id));
+
         (self.item_count() + Size(1)).write_at(self.storage, self.data.addr + ITEM_COUNT_OFFSET);
 
         new_id
     }
 
-    pub fn delete_record(&mut self, record_id: RecordId) {
+    pub fn delete_record(&mut self, record_id: RecordId) -> Record {
         #[cfg(debug_assertions)]
         {
             self.iter_free(|id| assert!(record_id != id));
         }
 
         let record_addr = self.record_addr(record_id);
-        assert!(Address::read_at(self.storage, record_addr) != Address(0));
+        let deleted_record = Record::read_at(self.storage, record_addr);
+        assert!(deleted_record.addr != EMPTY_RECORD_ADDRESS);
+        assert!(deleted_record.addr != PENDING_RECORD_ADDRESS);
 
         fill_zero(&mut self.storage.get_bytes_mut(record_addr, RECORD_SIZE));
 
@@ -281,6 +287,8 @@ impl<'s, S: Storage + 's> RecordTableMut<'s, S> {
             self.iter_free(|id| found = found || (id == record_id));
             assert!(found);
         }
+
+        deleted_record
     }
 
     #[inline]
@@ -341,6 +349,33 @@ pub(crate) fn persist_record_table<S: Storage>(memory: &Memory<S>,
 // // const ARRAY_OFFSET: Size = Size(12);
 
     panic!()
+}
+
+pub(crate) struct RuntimeRecordTable<S: Storage> {
+    data: Allocation,
+    storage: ::std::marker::PhantomData<S>,
+}
+
+impl<S: Storage> RuntimeRecordTable<S> {
+    pub(crate) fn with<R, F: FnOnce(&RecordTable<S>) -> R>(&self, memory: &Memory<S>, f: F) -> R {
+        let record_table = RecordTable::at(memory, self.data.addr, self.data.size);
+        f(&record_table)
+    }
+
+    pub(crate) fn with_mut<R, F: FnOnce(&mut RecordTableMut<S>) -> R>(&self, memory: &Memory<S>, f: F) -> R {
+        assert!(!S::IS_READONLY);
+        let record_table = RecordTableMut::at(memory, self.data.addr, self.data.size);
+        let result = f(&mut record_table);
+        self.data = record_table.data;
+        result
+    }
+
+    pub(crate) fn from(table: RecordTableMut<S>) -> RuntimeRecordTable<S> {
+        RuntimeRecordTable {
+            data: table.data,
+            storage: ::std::marker::PhantomData,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -410,7 +445,8 @@ mod tests {
                 ref_count: i * 11,
             };
 
-            let id = record_table.alloc_record(record);
+            let id = record_table.alloc_record();
+            record_table.set_record(id, record);
 
             records.push((id, record));
         }
@@ -436,15 +472,18 @@ mod tests {
                 ref_count: i * 11,
             };
 
-            let id = record_table.alloc_record(record);
+            let id = record_table.alloc_record();
+            record_table.set_record(id, record);
 
-            records.push(id);
+            records.push((id, record));
         }
 
         let mut free_records = record_table.all_free();
 
-        for id in records {
-            record_table.delete_record(id);
+        for (id, record) in records {
+            let deleted_record = record_table.delete_record(id);
+
+            assert_eq!(record, deleted_record);
 
             free_records.push(id);
             free_records.sort();
